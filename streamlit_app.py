@@ -1,1277 +1,541 @@
-# ONE WAY PICKZ — TENNIS V2 FULL CLEAN
-# Full tennis prop projection app using a V1/V11-style workflow:
-# - Underdog active line pull with manual/upload fallback
-# - ATP/WTA historical match-stat pull
-# - Player master stat log from day one
-# - Underdog player/line history log
-# - Elite player identification
-# - Aces, Player Games, Total Games, Break Points, Breaks, Tiebreak watch, Fantasy Points
-# - Serving, returning, rally/shot proxy, physical/workload, surface, H2H, match-length engine
-# - Save snapshots, after-grade learning, player/bucket bias correction
-# - V4 9.6 layer: CLV tracker, sample-size gates, remote CSV imports for free injury/draw/charting feeds
-#
-# Run:
-#   pip install streamlit pandas numpy requests
-#   streamlit run one_way_pickz_tennis_v2_full_clean.py
+# ONE WAY PICKZ — TENNIS V5 EASY RUN
+# Streamlit Cloud ready. Real data first, manual/upload fallback always available.
 
-import json
-import math
-import os
-import re
-import warnings
+import io, os, re, json, math, time, warnings
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings('ignore')
 
-APP_VERSION = "ONE WAY PICKZ — TENNIS V4 9.6 CLV + LEARNING"
-CURRENT_YEAR = datetime.now().year
-DATA_DIR = "tennis_v2_data"
-os.makedirs(DATA_DIR, exist_ok=True)
+APP_VERSION = "ONE WAY PICKZ — TENNIS V5 EASY RUN"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+LOG_DIR = os.path.join(BASE_DIR, 'logs')
+SAMPLE_DIR = os.path.join(BASE_DIR, 'samples')
+for d in [DATA_DIR, LOG_DIR, SAMPLE_DIR]: os.makedirs(d, exist_ok=True)
 
-SNAPSHOT_FILE = os.path.join(DATA_DIR, "tennis_projection_snapshots.csv")
-GRADE_FILE = os.path.join(DATA_DIR, "tennis_after_grades.csv")
-LEARNING_FILE = os.path.join(DATA_DIR, "tennis_learning_memory.csv")
-MASTER_LOG_FILE = os.path.join(DATA_DIR, "tennis_player_master_log.csv")
-UD_LOG_FILE = os.path.join(DATA_DIR, "tennis_underdog_line_log.csv")
-ELITE_FILE = os.path.join(DATA_DIR, "tennis_elite_player_tags.csv")
-CHARTING_FILE = os.path.join(DATA_DIR, "tennis_charting_true_metrics.csv")
-STATUS_FILE = os.path.join(DATA_DIR, "tennis_status_flags.csv")
-DRAW_FILE = os.path.join(DATA_DIR, "tennis_draw_status.csv")
-CLV_FILE = os.path.join(DATA_DIR, "tennis_clv_tracker.csv")
+SNAPSHOT_FILE = os.path.join(LOG_DIR, 'projection_snapshots.csv')
+GRADE_FILE = os.path.join(LOG_DIR, 'graded_results.csv')
+LEARNING_FILE = os.path.join(LOG_DIR, 'learning_memory.csv')
+UD_LOG_FILE = os.path.join(LOG_DIR, 'underdog_line_log.csv')
+MASTER_FILE = os.path.join(LOG_DIR, 'player_master_stats.csv')
+HISTORY_CACHE = os.path.join(DATA_DIR, 'tennis_history_cache.csv')
 
-UNDERDOG_ENDPOINTS = [
-    "https://api.underdogfantasy.com/beta/v5/over_under_lines",
-    "https://api.underdogfantasy.com/beta/v4/over_under_lines",
-    "https://api.underdogfantasy.com/beta/v3/over_under_lines",
-]
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json,text/plain,*/*",
-    "Origin": "https://underdogfantasy.com",
-    "Referer": "https://underdogfantasy.com/",
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+    'Accept': 'application/json,text/plain,*/*',
+    'Origin': 'https://underdogfantasy.com',
+    'Referer': 'https://underdogfantasy.com/'
 }
+UNDERDOG_ENDPOINTS = [
+    'https://api.underdogfantasy.com/beta/v5/over_under_lines',
+    'https://api.underdogfantasy.com/beta/v4/over_under_lines',
+    'https://api.underdogfantasy.com/beta/v3/over_under_lines',
+]
+SURFACE_FACTOR = {'Hard':1.00,'Clay':0.92,'Grass':1.13,'Carpet':1.06,'Unknown':1.00}
+INDOOR_FACTOR = {'Outdoor':1.00,'Indoor':1.055,'Unknown':1.00}
+LEVEL_FACTOR = {'Grand Slam':1.08,'Masters / WTA 1000':1.045,'ATP/WTA 500':1.015,'ATP/WTA 250':1.00,'Challenger / Qualifier':0.955,'Unknown':1.00}
 
-TENNIS_KEYWORDS = ["tennis", "atp", "wta", "challenger", "itf", "wimbledon", "roland", "us open", "australian open"]
-SURFACE_FACTOR = {"Hard": 1.00, "Clay": 0.92, "Grass": 1.13, "Carpet": 1.06, "Unknown": 1.00}
-INDOOR_FACTOR = {"Outdoor": 1.00, "Indoor": 1.055, "Unknown": 1.00}
-TOURNEY_LEVEL_FACTOR = {
-    "Grand Slam": 1.08,
-    "Masters / WTA 1000": 1.045,
-    "ATP/WTA 500": 1.015,
-    "ATP/WTA 250": 1.00,
-    "Challenger / Qualifier": 0.955,
-    "Unknown": 1.00,
-}
-LEVEL_MAP = {"G": "Grand Slam", "M": "Masters / WTA 1000", "A": "ATP/WTA 250", "D": "Team", "F": "Finals", "C": "Challenger / Qualifier", "S": "Unknown"}
-
-# ------------------------------ UI ------------------------------
-st.set_page_config(page_title=APP_VERSION, page_icon="🎾", layout="wide", initial_sidebar_state="expanded")
-st.markdown("""
+st.set_page_config(page_title=APP_VERSION, page_icon='🎾', layout='wide', initial_sidebar_state='expanded')
+st.markdown('''
 <style>
-.stApp {background:#090d11;color:#e7fff2;}
-section[data-testid="stSidebar"] {background:#0d131a;}
-.big-title {font-size:35px;font-weight:900;color:#00ff88;letter-spacing:.3px;margin-bottom:0}
-.sub-title {font-size:14px;color:#9fb2ac;margin-bottom:15px}
-.card {background:#111820;border:1px solid #23313d;border-radius:18px;padding:16px;margin:10px 0;box-shadow:0 0 18px rgba(0,255,136,.06)}
-.muted{color:#8ca09a}.good{color:#00ff88;font-weight:900}.warn{color:#ffd166;font-weight:900}.bad{color:#ff4d6d;font-weight:900}
-.kpi {background:#0e151b;border:1px solid #1d2b35;border-radius:14px;padding:12px;margin:4px}.kpi-value {font-size:22px;font-weight:900;color:#e7fff2}.kpi-label{font-size:12px;color:#8ca09a}
+.stApp{background:#090d11;color:#e7fff2}.big-title{font-size:34px;font-weight:900;color:#00ff88}.sub-title{color:#a9bbb5;font-size:14px}.card{background:#111820;border:1px solid #24323f;border-radius:18px;padding:16px;margin:10px 0}.good{color:#00ff88;font-weight:900}.warn{color:#ffd166;font-weight:900}.bad{color:#ff4d6d;font-weight:900}.muted{color:#91a49e}.kpi{background:#0e151b;border:1px solid #1d2b35;border-radius:14px;padding:12px}.kpi-v{font-size:25px;font-weight:900}.kpi-l{font-size:12px;color:#91a49e}
 </style>
-""", unsafe_allow_html=True)
+''', unsafe_allow_html=True)
 
-# ------------------------------ helpers ------------------------------
-def clean_name(x) -> str:
-    if x is None:
-        return ""
-    x = str(x).replace("_", " ").replace("-", " ")
-    x = re.sub(r"[^A-Za-zÀ-ÿ' .]", "", x)
-    return re.sub(r"\s+", " ", x).strip()
+def clean_name(x):
+    if x is None: return ''
+    x=str(x).replace('_',' ').replace('-',' ')
+    x=re.sub(r"[^A-Za-zÀ-ÿ' .]",'',x)
+    return re.sub(r'\s+',' ',x).strip()
 
-def norm_name(x) -> str:
-    return clean_name(x).lower()
-
-def safe_float(x, default=np.nan):
+def norm(x): return clean_name(x).lower()
+def sf(x, default=np.nan):
     try:
-        if x is None or x == "":
-            return default
+        if x is None or x=='': return default
         return float(x)
-    except Exception:
-        return default
+    except Exception: return default
 
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
+def clamp(x,a,b): return max(a,min(b,x))
+def sigmoid(x): return 1/(1+math.exp(-x))
+def prob_over(edge,sigma): return 100*sigmoid(1.702*(edge/max(sigma,.01)))
 
-def sigmoid(x):
-    return 1.0 / (1.0 + math.exp(-x))
+def prop_bucket(stat):
+    s=str(stat).lower()
+    if 'ace' in s: return 'ACES'
+    if 'double' in s and 'fault' in s: return 'DOUBLE_FAULTS'
+    if 'break point' in s: return 'BREAK_POINTS'
+    if 'break' in s and 'tie' not in s: return 'BREAKS'
+    if 'tie' in s and 'break' in s: return 'TIEBREAK'
+    if 'total' in s and 'game' in s: return 'TOTAL_GAMES'
+    if 'games played' in s: return 'TOTAL_GAMES'
+    if 'game' in s: return 'PLAYER_GAMES'
+    if 'set' in s: return 'SETS'
+    if 'winner' in s or 'moneyline' in s: return 'MATCH_WINNER'
+    return 'OTHER'
 
-def normal_prob_over(edge, sigma):
-    if sigma <= 0 or pd.isna(edge):
-        return np.nan
-    return 100 * sigmoid(1.702 * (edge / sigma))
-
-def prop_bucket(stat: str) -> str:
-    s = str(stat).lower()
-    if "ace" in s:
-        return "ACES"
-    if "double fault" in s or "fault" in s:
-        return "DOUBLE_FAULTS"
-    if "break point" in s:
-        return "BREAK_POINTS"
-    if "break" in s:
-        return "BREAKS"
-    if "tie" in s and "break" in s:
-        return "TIEBREAK"
-    if "total" in s and "game" in s:
-        return "TOTAL_GAMES"
-    if "game" in s:
-        return "PLAYER_GAMES"
-    if "fantasy" in s:
-        return "FANTASY_POINTS"
-    if "set" in s:
-        return "SETS"
-    if "match" in s or "winner" in s:
-        return "MATCH_WINNER"
-    return "OTHER"
-
-def read_csv_safe(path):
-    try:
-        return pd.read_csv(path)
-    except Exception:
-        return pd.DataFrame()
+def read_csv(path):
+    try: return pd.read_csv(path)
+    except Exception: return pd.DataFrame()
 
 def append_csv(path, df):
-    if df is None or df.empty:
-        return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    old = read_csv_safe(path)
-    out = pd.concat([old, df], ignore_index=True) if not old.empty else df.copy()
-    out.to_csv(path, index=False)
+    if df is None or df.empty: return
+    old=read_csv(path)
+    out=pd.concat([old,df],ignore_index=True) if not old.empty else df.copy()
+    out.to_csv(path,index=False)
 
-def write_dedup_csv(path, df, subset=None):
-    if df is None or df.empty:
-        return
-    out = df.copy()
-    if subset:
-        out = out.drop_duplicates(subset=subset, keep="last")
-    out.to_csv(path, index=False)
-
-@st.cache_data(ttl=900, show_spinner=False)
-def read_remote_csv(url):
-    """Optional free/live overlay hook. Use a raw GitHub/Google Sheets CSV URL for charting, injury/status, draw, or closing-line data."""
-    if not url or not str(url).strip():
-        return pd.DataFrame(), ""
-    try:
-        r = requests.get(str(url).strip(), headers=HEADERS, timeout=15)
-        if r.status_code != 200:
-            return pd.DataFrame(), f"HTTP {r.status_code}"
-        from io import StringIO
-        return pd.read_csv(StringIO(r.text)), ""
-    except Exception as e:
-        return pd.DataFrame(), str(e)
-
-def signed_clv(open_line, close_line, decision):
-    """Positive means we beat the closing line. Example: Over 4.5 closing 5.5 = +1.0; Under 5.5 closing 4.5 = +1.0."""
-    o = safe_float(open_line); c = safe_float(close_line)
-    if pd.isna(o) or pd.isna(c):
-        return np.nan
-    d = str(decision).upper()
-    if d == "OVER":
-        return round(c - o, 3)
-    if d == "UNDER":
-        return round(o - c, 3)
-    return np.nan
-
-def clv_signal(player, bucket):
-    clv = read_csv_safe(CLV_FILE)
-    if clv.empty or "Signed CLV" not in clv.columns:
-        return 0.0, "NO_CLV"
-    m = clv.copy()
-    for col in ["Player", "Bucket"]:
-        if col not in m.columns:
-            m[col] = ""
-    m["Signed CLV"] = pd.to_numeric(m["Signed CLV"], errors="coerce")
-    pk, b = norm_name(player), str(bucket)
-    sub = m[(m["Player"].map(norm_name)==pk) & (m["Bucket"].astype(str)==b)]["Signed CLV"].dropna().tail(30)
-    label_parts = []
-    if len(sub) >= 3:
-        avg = float(sub.mean())
-        adj = clamp(avg * 1.7, -2.5, 2.5)
-        label_parts.append(f"PLY_PROP_CLV:{avg:+.2f}/{len(sub)}")
-        return adj, " | ".join(label_parts)
-    sub = m[m["Bucket"].astype(str)==b]["Signed CLV"].dropna().tail(60)
-    if len(sub) >= 8:
-        avg = float(sub.mean())
-        adj = clamp(avg * 0.85, -1.4, 1.4)
-        return adj, f"PROP_CLV:{avg:+.2f}/{len(sub)}"
-    return 0.0, "LOW_CLV_SAMPLE"
-
-def sample_size_gate(bucket, p, opp):
-    """Hardens the official filter so the app does not trust weak samples. Returns confidence tax, reliability tax, block flag, note."""
-    p_matches = int(p.get("matches", 0) or 0)
-    p_surf = int(p.get("surface_matches", 0) or 0)
-    opp_matches = int(opp.get("matches", 0) or 0)
-    reasons, conf_tax, rel_tax, block = [], 0.0, 0.0, False
-    if p_matches < 8:
-        conf_tax += 5.0; rel_tax += 10.0; reasons.append("player match sample <8")
-    if p_surf < 4:
-        conf_tax += 3.0; rel_tax += 6.0; reasons.append("surface sample <4")
-    if opp_matches < 6:
-        conf_tax += 2.0; rel_tax += 5.0; reasons.append("opponent sample <6")
-    if bucket == "ACES" and p_surf < 6:
-        conf_tax += 2.5; rel_tax += 5.0; reasons.append("ace surface volume light")
-    if bucket in ["BREAK_POINTS", "BREAKS"] and (p_surf < 6 or opp_matches < 10):
-        conf_tax += 3.0; rel_tax += 6.0; reasons.append("break-market sample light")
-    if p_matches < 4 or (bucket in ["BREAK_POINTS", "BREAKS"] and p_matches < 8):
-        block = True; reasons.append("sample block")
-    return conf_tax, rel_tax, block, "; ".join(reasons) if reasons else "SAMPLE_OK"
-
-# ------------------------------ Underdog parser ------------------------------
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_underdog_raw() -> Tuple[dict, str, str]:
-    last = ""
-    for url in UNDERDOG_ENDPOINTS:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=12)
-            if r.status_code == 200 and r.text.strip().startswith("{"):
-                return r.json(), url, ""
-            last = f"{url} HTTP {r.status_code}"
-        except Exception as e:
-            last = f"{url} {e}"
-    return {}, "", last
-
-def _idx(items):
-    return {str(x.get("id")): x for x in (items or []) if isinstance(x, dict) and x.get("id") is not None}
-
-def _line_value(line):
-    candidates = [line.get("stat_value"), line.get("line"), line.get("value")]
-    ou = line.get("over_under") if isinstance(line.get("over_under"), dict) else {}
-    candidates += [ou.get("stat_value"), ou.get("line")]
-    for c in candidates:
-        v = safe_float(c)
-        if not pd.isna(v):
-            return v
-    return np.nan
-
-def _stat_title(line):
-    for k in ["stat", "stat_type", "stat_type_display", "display_stat", "title", "stat_title", "name"]:
-        v = line.get(k)
-        if isinstance(v, str) and v:
-            return v
-        if isinstance(v, dict):
-            for kk in ["display_stat", "stat", "name", "title"]:
-                if v.get(kk):
-                    return str(v.get(kk))
-    ou = line.get("over_under") if isinstance(line.get("over_under"), dict) else {}
-    app_stat = ou.get("appearance_stat") if isinstance(ou.get("appearance_stat"), dict) else {}
-    for kk in ["display_stat", "stat", "name", "title"]:
-        if app_stat.get(kk):
-            return str(app_stat.get(kk))
-    return "Unknown"
-
-def parse_underdog(payload: dict) -> pd.DataFrame:
-    if not payload:
-        return pd.DataFrame()
-    data = payload.get("data", payload)
-    if isinstance(data, dict):
-        lines = data.get("over_under_lines") or data.get("lines") or data.get("over_unders") or []
-        appearances = data.get("appearances") or []
-        players = data.get("players") or []
-        games = data.get("games") or data.get("solo_games") or []
-    elif isinstance(data, list):
-        lines, appearances, players, games = data, [], [], []
-    else:
-        return pd.DataFrame()
-    app_i, player_i, game_i = _idx(appearances), _idx(players), _idx(games)
-    rows = []
-    for line in lines:
-        if not isinstance(line, dict):
-            continue
-        ou = line.get("over_under") if isinstance(line.get("over_under"), dict) else {}
-        app_stat = ou.get("appearance_stat") if isinstance(ou.get("appearance_stat"), dict) else {}
-        appearance_id = app_stat.get("appearance_id") or line.get("appearance_id") or ou.get("appearance_id")
-        app = app_i.get(str(appearance_id), {}) if appearance_id is not None else {}
-        player_id = app.get("player_id") or line.get("player_id")
-        player = player_i.get(str(player_id), {}) if player_id is not None else {}
-        name = player.get("display_name") or player.get("name") or app.get("player_name") or line.get("player_name") or line.get("title") or ""
-        stat = _stat_title(line)
-        bucket = prop_bucket(stat)
-        full_text = (json.dumps(line) + json.dumps(app) + json.dumps(player)).lower()
-        is_tennis = any(k in full_text for k in TENNIS_KEYWORDS) or bucket in ["ACES", "PLAYER_GAMES", "TOTAL_GAMES", "BREAK_POINTS", "BREAKS", "TIEBREAK", "SETS", "DOUBLE_FAULTS"]
-        if not is_tennis:
-            continue
-        match_id = app.get("match_id") or app.get("game_id") or line.get("game_id")
-        game = game_i.get(str(match_id), {}) if match_id is not None else {}
-        matchup = game.get("title") or game.get("match_title") or game.get("name") or app.get("matchup") or line.get("matchup") or ""
-        rows.append({
-            "Player": clean_name(name), "Opponent": "", "Matchup": matchup, "Stat": stat, "Bucket": bucket,
-            "UD/Line": _line_value(line), "Line Source": "Underdog", "Start Time": game.get("scheduled_at") or app.get("scheduled_at") or line.get("scheduled_at") or "", "Raw ID": line.get("id", "")
-        })
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    df = df[df["Player"].astype(str).str.len() > 1]
-    df = df.drop_duplicates(subset=["Player", "Stat", "UD/Line", "Matchup"])
-    df["Pulled At"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return df.reset_index(drop=True)
-
-# ------------------------------ Tennis historical loader ------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_matches(years: List[int]) -> pd.DataFrame:
-    frames = []
-    for tour in ["atp", "wta"]:
-        repo = "tennis_atp" if tour == "atp" else "tennis_wta"
-        prefix = "atp" if tour == "atp" else "wta"
+def load_history(years_back:int=4, force_refresh:bool=False):
+    if os.path.exists(HISTORY_CACHE) and not force_refresh:
+        try:
+            c=pd.read_csv(HISTORY_CACHE, low_memory=False)
+            if len(c)>1000: return c, 'LOCAL_CACHE', ''
+        except Exception: pass
+    current=datetime.now().year
+    years=list(range(current-years_back, current+1))
+    frames=[]; errors=[]
+    for tour in ['atp','wta']:
+        repo='tennis_atp' if tour=='atp' else 'tennis_wta'
+        pref='atp' if tour=='atp' else 'wta'
         for y in years:
-            url = f"https://raw.githubusercontent.com/JeffSackmann/{repo}/master/{prefix}_matches_{y}.csv"
+            url=f'https://raw.githubusercontent.com/JeffSackmann/{repo}/master/{pref}_matches_{y}.csv'
             try:
-                d = pd.read_csv(url, low_memory=False)
-                d["tour"] = tour.upper()
-                frames.append(d)
-            except Exception:
-                pass
-    if not frames:
-        return pd.DataFrame()
-    df = pd.concat(frames, ignore_index=True)
-    df["tourney_date"] = pd.to_numeric(df.get("tourney_date"), errors="coerce")
-    return df.sort_values("tourney_date").reset_index(drop=True)
+                r=requests.get(url,headers={'User-Agent':HEADERS['User-Agent']},timeout=18)
+                if r.status_code==200 and len(r.text)>1000:
+                    d=pd.read_csv(io.StringIO(r.text), low_memory=False)
+                    d['tour']=tour.upper(); frames.append(d)
+                else:
+                    errors.append(f'{pref} {y}: HTTP {r.status_code}')
+            except Exception as e:
+                errors.append(f'{pref} {y}: {str(e)[:70]}')
+    if frames:
+        df=pd.concat(frames, ignore_index=True)
+        df['tourney_date']=pd.to_numeric(df.get('tourney_date'), errors='coerce')
+        df=df.sort_values('tourney_date').reset_index(drop=True)
+        try: df.to_csv(HISTORY_CACHE,index=False)
+        except Exception: pass
+        return df, 'JEFF_SACKMANN_GITHUB', ' | '.join(errors[-4:])
+    seed=os.path.join(SAMPLE_DIR,'seed_history.csv')
+    if os.path.exists(seed):
+        try: return pd.read_csv(seed), 'SEED_SAMPLE_FALLBACK', 'Real history failed: '+' | '.join(errors[-4:])
+        except Exception: pass
+    return pd.DataFrame(), 'EMPTY', ' | '.join(errors[-8:])
 
-def _row_for_player(r, won: bool) -> dict:
-    p = "w" if won else "l"
-    o = "loser" if won else "winner"
-    # opponent-side stats are crucial for ace allowed, return, pressure estimates
-    op = "l" if won else "w"
-    return {
-        "date": safe_float(r.get("tourney_date")),
-        "surface": r.get("surface", "Unknown") or "Unknown",
-        "tour": r.get("tour", ""),
-        "level_raw": r.get("tourney_level", ""),
-        "round": r.get("round", ""),
-        "won": int(won),
-        "player_name": r.get(f"{ 'winner' if won else 'loser' }_name", ""),
-        "opp_name": r.get(f"{o}_name", ""),
-        "rank": safe_float(r.get(f"{p}_rank")),
-        "rank_points": safe_float(r.get(f"{p}_rank_points")),
-        "opp_rank": safe_float(r.get(f"{o}_rank")),
-        "aces": safe_float(r.get(f"{p}_ace"), 0),
-        "df": safe_float(r.get(f"{p}_df"), 0),
-        "svpt": safe_float(r.get(f"{p}_svpt")),
-        "first_in": safe_float(r.get(f"{p}_1stIn")),
-        "first_won": safe_float(r.get(f"{p}_1stWon")),
-        "second_won": safe_float(r.get(f"{p}_2ndWon")),
-        "service_games": safe_float(r.get(f"{p}_SvGms")),
-        "bp_saved": safe_float(r.get(f"{p}_bpSaved")),
-        "bp_faced": safe_float(r.get(f"{p}_bpFaced")),
-        "opp_aces": safe_float(r.get(f"{op}_ace"), 0),
-        "opp_df": safe_float(r.get(f"{op}_df"), 0),
-        "opp_svpt": safe_float(r.get(f"{op}_svpt")),
-        "opp_first_in": safe_float(r.get(f"{op}_1stIn")),
-        "opp_first_won": safe_float(r.get(f"{op}_1stWon")),
-        "opp_second_won": safe_float(r.get(f"{op}_2ndWon")),
-        "opp_service_games": safe_float(r.get(f"{op}_SvGms")),
-        "opp_bp_saved": safe_float(r.get(f"{op}_bpSaved")),
-        "opp_bp_faced": safe_float(r.get(f"{op}_bpFaced")),
-        "score": r.get("score", ""),
-        "best_of": safe_float(r.get("best_of"), 3),
-        "minutes": safe_float(r.get("minutes")),
-    }
+def row_for(r, won):
+    p='w' if won else 'l'; op='l' if won else 'w'; opp='loser' if won else 'winner'
+    name='winner' if won else 'loser'
+    return {'date':sf(r.get('tourney_date')),'surface':r.get('surface','Unknown') or 'Unknown','tour':r.get('tour',''),'level':r.get('tourney_level',''),'round':r.get('round',''), 'won':int(won),'player_name':r.get(f'{name}_name',''),'opp_name':r.get(f'{opp}_name',''), 'rank':sf(r.get(f'{p}_rank')), 'rank_points':sf(r.get(f'{p}_rank_points')), 'opp_rank':sf(r.get(f'{opp}_rank')), 'aces':sf(r.get(f'{p}_ace'),0),'df':sf(r.get(f'{p}_df'),0),'svpt':sf(r.get(f'{p}_svpt')),'first_in':sf(r.get(f'{p}_1stIn')),'first_won':sf(r.get(f'{p}_1stWon')),'second_won':sf(r.get(f'{p}_2ndWon')),'service_games':sf(r.get(f'{p}_SvGms')),'bp_saved':sf(r.get(f'{p}_bpSaved')),'bp_faced':sf(r.get(f'{p}_bpFaced')),'opp_aces':sf(r.get(f'{op}_ace'),0),'opp_svpt':sf(r.get(f'{op}_svpt')),'opp_first_in':sf(r.get(f'{op}_1stIn')),'opp_first_won':sf(r.get(f'{op}_1stWon')),'opp_second_won':sf(r.get(f'{op}_2ndWon')),'opp_service_games':sf(r.get(f'{op}_SvGms')),'opp_bp_saved':sf(r.get(f'{op}_bpSaved')),'opp_bp_faced':sf(r.get(f'{op}_bpFaced')),'score':r.get('score',''),'best_of':sf(r.get('best_of'),3),'minutes':sf(r.get('minutes'))}
 
-def player_rows(matches: pd.DataFrame, player: str, limit=160) -> pd.DataFrame:
-    if matches.empty or not player:
-        return pd.DataFrame()
-    p = norm_name(player)
-    w = matches[matches["winner_name"].astype(str).map(norm_name).str.contains(p, regex=False, na=False)]
-    l = matches[matches["loser_name"].astype(str).map(norm_name).str.contains(p, regex=False, na=False)]
-    rows = [_row_for_player(r, True) for _, r in w.iterrows()] + [_row_for_player(r, False) for _, r in l.iterrows()]
+def player_rows(hist, player, limit=180):
+    if hist.empty or not player: return pd.DataFrame()
+    p=norm(player)
+    w=hist[hist['winner_name'].astype(str).map(norm).str.contains(p,regex=False,na=False)] if 'winner_name' in hist else pd.DataFrame()
+    l=hist[hist['loser_name'].astype(str).map(norm).str.contains(p,regex=False,na=False)] if 'loser_name' in hist else pd.DataFrame()
+    rows=[row_for(r,True) for _,r in w.iterrows()]+[row_for(r,False) for _,r in l.iterrows()]
     if not rows:
-        last = p.split(" ")[-1] if p else ""
-        if len(last) >= 4:
-            w = matches[matches["winner_name"].astype(str).map(norm_name).str.contains(last, regex=False, na=False)]
-            l = matches[matches["loser_name"].astype(str).map(norm_name).str.contains(last, regex=False, na=False)]
-            rows = [_row_for_player(r, True) for _, r in w.iterrows()] + [_row_for_player(r, False) for _, r in l.iterrows()]
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    return out.sort_values("date").tail(limit).reset_index(drop=True)
+        last=p.split(' ')[-1] if p else ''
+        if len(last)>=4:
+            w=hist[hist['winner_name'].astype(str).map(norm).str.contains(last,regex=False,na=False)]
+            l=hist[hist['loser_name'].astype(str).map(norm).str.contains(last,regex=False,na=False)]
+            rows=[row_for(r,True) for _,r in w.iterrows()]+[row_for(r,False) for _,r in l.iterrows()]
+    out=pd.DataFrame(rows)
+    if out.empty: return out
+    return out.sort_values('date').tail(limit).reset_index(drop=True)
 
-def parse_score_games(score: str) -> Tuple[int, int, int, int]:
-    if not isinstance(score, str):
-        return 0, 0, 0, 0
-    sets = re.findall(r"(\d+)\-([0-9]+)", score)
-    p_games = sum(int(a) for a, _ in sets)
-    o_games = sum(int(b) for _, b in sets)
-    tbs = len(re.findall(r"7\-6|6\-7", score))
-    set_count = len(sets)
-    return p_games, o_games, tbs, set_count
-
-def h2h_summary(matches: pd.DataFrame, player: str, opp: str, surface="Unknown") -> dict:
-    if matches.empty or not player or not opp:
-        return {"H2H Matches": 0, "H2H Win %": 50.0, "H2H Surface Matches": 0}
-    p, o = norm_name(player), norm_name(opp)
-    mask1 = matches["winner_name"].astype(str).map(norm_name).str.contains(p, regex=False, na=False) & matches["loser_name"].astype(str).map(norm_name).str.contains(o, regex=False, na=False)
-    mask2 = matches["winner_name"].astype(str).map(norm_name).str.contains(o, regex=False, na=False) & matches["loser_name"].astype(str).map(norm_name).str.contains(p, regex=False, na=False)
-    h = matches[mask1 | mask2].copy()
-    if h.empty:
-        return {"H2H Matches": 0, "H2H Win %": 50.0, "H2H Surface Matches": 0}
-    if surface != "Unknown":
-        hs = h[h["surface"].astype(str).str.lower() == surface.lower()]
-    else:
-        hs = h
-    use = hs if len(hs) else h
-    wins = use["winner_name"].astype(str).map(norm_name).str.contains(p, regex=False, na=False).mean()
-    return {"H2H Matches": int(len(h)), "H2H Win %": round(100 * wins, 1), "H2H Surface Matches": int(len(use))}
-
-def infer_level(raw):
-    s = str(raw)
-    return LEVEL_MAP.get(s, "Unknown")
+def parse_score(score):
+    if not isinstance(score,str): return 0,0,0,0
+    sets=re.findall(r'(\d+)\-([0-9]+)', score)
+    gf=sum(int(a) for a,b in sets); ga=sum(int(b) for a,b in sets)
+    tb=len(re.findall(r'7\-6|6\-7', score)); return gf,ga,tb,len(sets)
 
 def default_summary(player):
-    return {
-        "player": player, "matches": 0, "surface_matches": 0, "win_pct": .50, "last10_win_pct": .50, "last25_win_pct": .50,
-        "rank": np.nan, "rank_points": np.nan, "ace_per_service_game": .52, "ace_per_svpt": .062, "opponent_ace_allowed_per_service_game": .52,
-        "df_per_service_game": .24, "first_in_pct": .61, "first_win_pct": .69, "second_win_pct": .50, "service_points_won_pct": .62,
-        "serve_effectiveness_pct": .66, "unreturned_serve_proxy_pct": .28, "first_return_won_proxy_pct": .30, "second_return_won_proxy_pct": .49,
-        "return_points_won_proxy": .37, "bp_save_pct": .60, "bp_convert_proxy_pct": .39, "bp_created_per_return_game": .55,
-        "hold_pct": .78, "break_pct": .22, "return_games_won_pct": .22, "tiebreak_rate": .22, "tiebreak_win_proxy_pct": .50,
-        "games_won_avg": 11.2, "games_total_avg": 22.4, "sets_avg": 2.25, "serve_strength": 62.5, "return_strength": 41.0, "overall_strength": 53.0,
-        "winner_proxy": 22.0, "unforced_error_proxy": 24.0, "forced_error_proxy": 18.0, "winner_error_ratio_proxy": .92, "shot_quality_proxy": 5.0,
-        "short_rally_edge_proxy": 5.0, "long_rally_edge_proxy": 5.0, "minutes_avg": np.nan, "matches_last14": 0, "workload_index": 50.0, "fatigue_tax": 0.0,
-        "rest_days": np.nan, "elite_tag": "UNKNOWN_SAMPLE", "reliability": 34.0
-    }
+    return {'player':player,'matches':0,'surface_matches':0,'win_pct':.50,'last10_win_pct':.50,'last25_win_pct':.50,'rank':np.nan,'rank_points':np.nan,'ace_per_service_game':.55,'ace_per_svpt':.065,'opponent_ace_allowed_per_service_game':.55,'df_per_service_game':.25,'first_in_pct':.61,'first_win_pct':.69,'second_win_pct':.50,'service_points_won_pct':.62,'return_points_won_pct':.37,'first_return_won_pct':.30,'second_return_won_pct':.49,'bp_save_pct':.60,'bp_convert_pct':.39,'bp_created_per_return_game':.55,'hold_pct':.78,'break_pct':.22,'tiebreak_rate':.18,'tiebreak_win_pct':.50,'games_won_avg':11.2,'games_total_avg':22.4,'sets_avg':2.25,'serve_strength':62,'return_strength':37,'overall_strength':50,'winner_proxy':18,'unforced_error_proxy':24,'forced_error_proxy':18,'shot_quality_proxy':5,'short_rally_edge_proxy':5,'long_rally_edge_proxy':5,'minutes_avg':np.nan,'matches_last14':0,'workload_index':50,'rest_days':np.nan,'fatigue_tax':0,'elite_tag':'NO_HISTORY','reliability':32}
 
-def summarize(matches: pd.DataFrame, player: str, surface="Unknown") -> dict:
-    rows = player_rows(matches, player, 160)
-    if rows.empty:
-        return default_summary(player)
-    surf = rows[rows["surface"].astype(str).str.lower() == surface.lower()] if surface != "Unknown" else rows
-    use = surf if len(surf) >= 6 else rows
-    last10 = rows.tail(10)
-    last25 = rows.tail(25)
-    sg = use["service_games"].replace(0, np.nan)
-    opp_sg = use["opp_service_games"].replace(0, np.nan)
-    svpt = use["svpt"].replace(0, np.nan)
-    opp_svpt = use["opp_svpt"].replace(0, np.nan)
-    first_in = use["first_in"].sum()
-    second_pts = use["svpt"].sum() - first_in
-    opp_first_in = use["opp_first_in"].sum()
-    opp_second_pts = use["opp_svpt"].sum() - opp_first_in
-
-    ace_sg = use["aces"].sum() / sg.sum() if sg.sum() and not pd.isna(sg.sum()) else .52
-    ace_svpt = use["aces"].sum() / svpt.sum() if svpt.sum() and not pd.isna(svpt.sum()) else .062
-    opp_ace_allowed_sg = use["opp_aces"].sum() / opp_sg.sum() if opp_sg.sum() and not pd.isna(opp_sg.sum()) else .52
-    df_sg = use["df"].sum() / sg.sum() if sg.sum() and not pd.isna(sg.sum()) else .24
-    first_in_pct = first_in / svpt.sum() if svpt.sum() and not pd.isna(svpt.sum()) else .61
-    first_win_pct = use["first_won"].sum() / first_in if first_in and not pd.isna(first_in) else .69
-    second_win_pct = use["second_won"].sum() / second_pts if second_pts and not pd.isna(second_pts) else .50
-    service_points_won = (use["first_won"].sum() + use["second_won"].sum()) / svpt.sum() if svpt.sum() and not pd.isna(svpt.sum()) else .62
-    bp_save = use["bp_saved"].sum() / use["bp_faced"].sum() if use["bp_faced"].sum() and not pd.isna(use["bp_faced"].sum()) else .60
-    # True return split is not always present in free CSV, so derive from opponent service points in the same matches.
-    return_points_won = 1 - ((use["opp_first_won"].sum() + use["opp_second_won"].sum()) / opp_svpt.sum()) if opp_svpt.sum() and not pd.isna(opp_svpt.sum()) else .37
-    first_return_won = 1 - (use["opp_first_won"].sum() / opp_first_in) if opp_first_in and not pd.isna(opp_first_in) else .30
-    second_return_won = 1 - (use["opp_second_won"].sum() / opp_second_pts) if opp_second_pts and not pd.isna(opp_second_pts) else .49
-    bp_convert_proxy = use["opp_bp_faced"].sum() - use["opp_bp_saved"].sum()
-    bp_convert_proxy = bp_convert_proxy / use["opp_bp_faced"].sum() if use["opp_bp_faced"].sum() and not pd.isna(use["opp_bp_faced"].sum()) else .39
-    bp_created_per_rg = use["opp_bp_faced"].sum() / opp_sg.sum() if opp_sg.sum() and not pd.isna(opp_sg.sum()) else .55
-
-    hold_pct = clamp(0.49 + 0.58 * service_points_won + 0.06 * bp_save - 0.045 * df_sg, 0.48, 0.94)
-    break_pct = clamp(0.10 + 1.75 * (return_points_won - .34) + .08 * bp_convert_proxy, .06, .48)
-    return_games_won_pct = break_pct
-
-    win_pct = float(use["won"].mean())
-    last10_win = float(last10["won"].mean()) if len(last10) else win_pct
-    last25_win = float(last25["won"].mean()) if len(last25) else win_pct
-    rank = use["rank"].dropna().tail(1).mean() if use["rank"].notna().any() else np.nan
-    rank_points = use["rank_points"].dropna().tail(1).mean() if use["rank_points"].notna().any() else np.nan
-
-    tiebreak_count = 0
-    tb_wins = 0
-    games_for, games_against, set_counts = [], [], []
-    for _, rr in use.iterrows():
-        gf, ga, tb, sc = parse_score_games(rr.get("score", ""))
-        tiebreak_count += tb
-        # coarse proxy: if won match with a tiebreak, credit slightly more TB strength
-        if tb > 0 and rr.get("won", 0) == 1:
-            tb_wins += 1
-        if gf + ga > 0:
-            if rr.get("won", 0) == 1:
-                games_for.append(gf); games_against.append(ga)
-            else:
-                games_for.append(ga); games_against.append(gf)
-            set_counts.append(sc)
-    games_won_avg = float(np.mean(games_for)) if games_for else 11.2
-    games_total_avg = float(np.mean(np.array(games_for) + np.array(games_against))) if games_for else 22.4
-    sets_avg = float(np.mean(set_counts)) if set_counts else 2.25
-    tiebreak_rate = tiebreak_count / max(len(use), 1)
-    tiebreak_win_proxy = clamp(.48 + .18 * (hold_pct - .78) + .12 * (win_pct - .5) + .04 * tb_wins / max(tiebreak_count, 1), .34, .68)
-
-    # Rally/shot metrics are rarely available free pre-match; use transparent proxies from serve/return/error profile.
-    serve_effectiveness = clamp(.47 + .45 * service_points_won + .70 * ace_svpt - .05 * df_sg, .45, .82)
-    unreturned_proxy = clamp(.12 + 2.15 * ace_svpt + .22 * (first_win_pct - .66), .12, .46)
-    winner_proxy = clamp(12 + 55 * ace_svpt + 18 * (first_win_pct - .66) + 7 * (return_points_won - .37), 8, 42)
-    unforced_error_proxy = clamp(17 + 18 * df_sg + 12 * (1 - second_win_pct) - 4 * (win_pct - .5), 12, 42)
-    forced_error_proxy = clamp(14 + 24 * return_points_won + 8 * break_pct, 10, 36)
-    wer = winner_proxy / max(unforced_error_proxy, 1)
-    shot_quality = clamp(5.0 + 4.0 * (service_points_won - .62) + 3.0 * (return_points_won - .37) + 0.7 * (wer - .9), 1.0, 10.0)
-    short_rally_edge = clamp(5.0 + 10 * (serve_effectiveness - .66) + 3 * (ace_svpt - .062), 1, 10)
-    long_rally_edge = clamp(5.0 + 9 * (return_points_won - .37) + 2.5 * (second_win_pct - .50) - .08 * (unforced_error_proxy - 24), 1, 10)
-
-    rest_days = np.nan
-    matches_last14 = 0
-    if rows["date"].notna().any():
+def summarize(hist, player, surface='Unknown'):
+    rows=player_rows(hist, player)
+    if rows.empty: return default_summary(player)
+    surf=rows[rows['surface'].astype(str).str.lower()==surface.lower()] if surface!='Unknown' else rows
+    use=surf if len(surf)>=6 else rows
+    last10=rows.tail(10); last25=rows.tail(25)
+    sg=use['service_games'].replace(0,np.nan); opp_sg=use['opp_service_games'].replace(0,np.nan)
+    svpt=use['svpt'].replace(0,np.nan); opp_svpt=use['opp_svpt'].replace(0,np.nan)
+    sv_sum=svpt.sum(); opp_sv_sum=opp_svpt.sum(); first_in=use['first_in'].sum(); opp_first_in=use['opp_first_in'].sum()
+    second_pts=sv_sum-first_in; opp_second_pts=opp_sv_sum-opp_first_in
+    ace_sg=use['aces'].sum()/sg.sum() if sg.sum() and not pd.isna(sg.sum()) else .55
+    ace_svpt=use['aces'].sum()/sv_sum if sv_sum and not pd.isna(sv_sum) else .065
+    opp_ace_allowed=use['opp_aces'].sum()/opp_sg.sum() if opp_sg.sum() and not pd.isna(opp_sg.sum()) else .55
+    df_sg=use['df'].sum()/sg.sum() if sg.sum() and not pd.isna(sg.sum()) else .25
+    first_in_pct=first_in/sv_sum if sv_sum and not pd.isna(sv_sum) else .61
+    first_win=use['first_won'].sum()/first_in if first_in and not pd.isna(first_in) else .69
+    second_win=use['second_won'].sum()/second_pts if second_pts and not pd.isna(second_pts) else .50
+    spw=(use['first_won'].sum()+use['second_won'].sum())/sv_sum if sv_sum and not pd.isna(sv_sum) else .62
+    rpw=1-((use['opp_first_won'].sum()+use['opp_second_won'].sum())/opp_sv_sum) if opp_sv_sum and not pd.isna(opp_sv_sum) else .37
+    frw=1-(use['opp_first_won'].sum()/opp_first_in) if opp_first_in and not pd.isna(opp_first_in) else .30
+    srw=1-(use['opp_second_won'].sum()/opp_second_pts) if opp_second_pts and not pd.isna(opp_second_pts) else .49
+    bp_save=use['bp_saved'].sum()/use['bp_faced'].sum() if use['bp_faced'].sum() and not pd.isna(use['bp_faced'].sum()) else .60
+    bp_convert=(use['opp_bp_faced'].sum()-use['opp_bp_saved'].sum())/use['opp_bp_faced'].sum() if use['opp_bp_faced'].sum() and not pd.isna(use['opp_bp_faced'].sum()) else .39
+    bp_created=use['opp_bp_faced'].sum()/opp_sg.sum() if opp_sg.sum() and not pd.isna(opp_sg.sum()) else .55
+    hold=clamp(.49+.58*spw+.06*bp_save-.045*df_sg,.48,.94)
+    brk=clamp(.10+1.75*(rpw-.34)+.08*bp_convert,.06,.48)
+    win=float(use['won'].mean()); last10w=float(last10['won'].mean()) if len(last10) else win; last25w=float(last25['won'].mean()) if len(last25) else win
+    rank=use['rank'].dropna().tail(1).mean() if use['rank'].notna().any() else np.nan
+    rp=use['rank_points'].dropna().tail(1).mean() if use['rank_points'].notna().any() else np.nan
+    gfs=[]; gas=[]; sets=[]; tbs=0
+    for _,rr in use.iterrows():
+        gf,ga,tb,sc=parse_score(rr.get('score','')); tbs+=tb
+        if gf+ga>0:
+            if rr.get('won',0)==1: gfs.append(gf); gas.append(ga)
+            else: gfs.append(ga); gas.append(gf)
+            sets.append(sc)
+    games_avg=float(np.mean(gfs)) if gfs else 11.2; total_avg=float(np.mean(np.array(gfs)+np.array(gas))) if gfs else 22.4; sets_avg=float(np.mean(sets)) if sets else 2.25
+    tb_rate=tbs/max(len(use),1); tb_win=clamp(.48+.18*(hold-.78)+.12*(win-.5),.34,.68)
+    winner=clamp(12+55*ace_svpt+18*(first_win-.66)+7*(rpw-.37),8,42)
+    ue=clamp(17+18*df_sg+12*(1-second_win)-4*(win-.5),12,42)
+    fe=clamp(14+24*rpw+8*brk,10,36)
+    shot=clamp(5+4*(spw-.62)+3*(rpw-.37)+.7*(winner/max(ue,1)-.9),1,10)
+    short=clamp(5+10*((.47+.45*spw+0.7*ace_svpt)-.66)+3*(ace_svpt-.062),1,10)
+    long=clamp(5+9*(rpw-.37)+2.5*(second_win-.50)-.08*(ue-24),1,10)
+    rest=np.nan; last14=0
+    if rows['date'].notna().any():
         try:
-            dates = pd.to_datetime(rows["date"].dropna().astype(int).astype(str), format="%Y%m%d")
-            last_dt = dates.iloc[-1]
-            now = pd.Timestamp(datetime.now().date())
-            rest_days = int((now - last_dt).days)
-            matches_last14 = int((dates >= (now - pd.Timedelta(days=14))).sum())
-        except Exception:
-            pass
-    minutes_avg = use["minutes"].dropna().mean() if use["minutes"].notna().any() else np.nan
-    workload_index = 50 + 5 * matches_last14 + (0 if pd.isna(minutes_avg) else clamp((minutes_avg - 95) / 3, -12, 18))
-    fatigue_tax = 0.0
-    if not pd.isna(rest_days):
-        if rest_days <= 1:
-            fatigue_tax -= .045
-        elif rest_days <= 3:
-            fatigue_tax -= .015
-        elif rest_days >= 21:
-            fatigue_tax -= .025
-    if workload_index >= 75:
-        fatigue_tax -= .025
+            dates=pd.to_datetime(rows['date'].dropna().astype(int).astype(str),format='%Y%m%d')
+            now=pd.Timestamp(datetime.now().date()); rest=int((now-dates.iloc[-1]).days); last14=int((dates>=now-pd.Timedelta(days=14)).sum())
+        except Exception: pass
+    mins=use['minutes'].dropna().mean() if use['minutes'].notna().any() else np.nan
+    workload=50+5*last14+(0 if pd.isna(mins) else clamp((mins-95)/3,-12,18))
+    fatigue=0
+    if not pd.isna(rest):
+        if rest<=1: fatigue-=.045
+        elif rest<=3: fatigue-=.015
+        elif rest>=21: fatigue-=.025
+    if workload>=75: fatigue-=.025
+    serve=100*spw+9*ace_svpt+6*(hold-.75)+3*(last10w-.5)-1.8*df_sg
+    ret=100*rpw+18*brk+3*(bp_convert-.39)+2.5*(last10w-.5)
+    rank_adj=0 if pd.isna(rank) else clamp((75-rank)/22,-2.2,2.2)
+    overall=.54*serve+.46*ret+rank_adj+.8*(shot-5)
+    tags=[]
+    if spw>=.66 or ace_sg>=.78 or hold>=.84: tags.append('ELITE_SERVER')
+    if rpw>=.405 or brk>=.29: tags.append('ELITE_RETURNER')
+    if not pd.isna(rank) and rank<=25: tags.append('TOP_25')
+    if last10w>=.70: tags.append('HOT_FORM')
+    if workload>=78: tags.append('FATIGUE_RISK')
+    rel=clamp(34+len(use)*1.0+len(rows)*.25+(6 if len(surf)>=8 else 0),30,96)
+    return {'player':player,'matches':int(len(rows)),'surface_matches':int(len(use)),'win_pct':win,'last10_win_pct':last10w,'last25_win_pct':last25w,'rank':rank,'rank_points':rp,'ace_per_service_game':ace_sg,'ace_per_svpt':ace_svpt,'opponent_ace_allowed_per_service_game':opp_ace_allowed,'df_per_service_game':df_sg,'first_in_pct':first_in_pct,'first_win_pct':first_win,'second_win_pct':second_win,'service_points_won_pct':spw,'return_points_won_pct':rpw,'first_return_won_pct':frw,'second_return_won_pct':srw,'bp_save_pct':bp_save,'bp_convert_pct':bp_convert,'bp_created_per_return_game':bp_created,'hold_pct':hold,'break_pct':brk,'tiebreak_rate':tb_rate,'tiebreak_win_pct':tb_win,'games_won_avg':games_avg,'games_total_avg':total_avg,'sets_avg':sets_avg,'serve_strength':serve,'return_strength':ret,'overall_strength':overall,'winner_proxy':winner,'unforced_error_proxy':ue,'forced_error_proxy':fe,'shot_quality_proxy':shot,'short_rally_edge_proxy':short,'long_rally_edge_proxy':long,'minutes_avg':mins,'matches_last14':last14,'workload_index':workload,'rest_days':rest,'fatigue_tax':fatigue,'elite_tag':','.join(tags) if tags else 'STANDARD','reliability':rel}
 
-    serve_strength = 100 * service_points_won + 9 * ace_svpt + 6 * (hold_pct - .75) + 3.0 * (last10_win - .5) - 1.8 * df_sg
-    return_strength = 100 * return_points_won + 18 * break_pct + 3 * (bp_convert_proxy - .39) + 2.5 * (last10_win - .5)
-    rank_adj = 0 if pd.isna(rank) else clamp((75 - rank) / 22, -2.2, 2.2)
-    overall_strength = 0.54 * serve_strength + 0.46 * return_strength + rank_adj + 0.8 * (shot_quality - 5)
-    reliability = clamp(34 + len(use) * 1.0 + len(rows) * .25 + (6 if len(surf) >= 8 else 0), 30, 96)
+def stat_title(line):
+    for k in ['stat','stat_type','stat_type_display','display_stat','title','stat_title','name']:
+        v=line.get(k) if isinstance(line,dict) else None
+        if isinstance(v,str) and v: return v
+        if isinstance(v,dict):
+            for kk in ['display_stat','stat','name','title']:
+                if v.get(kk): return str(v.get(kk))
+    ou=line.get('over_under') if isinstance(line.get('over_under'),dict) else {}
+    app=ou.get('appearance_stat') if isinstance(ou.get('appearance_stat'),dict) else {}
+    for kk in ['display_stat','stat','name','title']:
+        if app.get(kk): return str(app.get(kk))
+    return 'Unknown'
 
-    elite_tag = "STANDARD"
-    tags = []
-    if service_points_won >= .66 or ace_sg >= .78 or hold_pct >= .84:
-        tags.append("ELITE_SERVER")
-    if return_points_won >= .405 or break_pct >= .29:
-        tags.append("ELITE_RETURNER")
-    if not pd.isna(rank) and rank <= 25:
-        tags.append("TOP_25")
-    if last10_win >= .70:
-        tags.append("HOT_FORM")
-    if shot_quality >= 6.4:
-        tags.append("HIGH_SHOT_QUALITY")
-    if workload_index >= 78:
-        tags.append("FATIGUE_RISK")
-    elite_tag = ",".join(tags) if tags else "STANDARD"
+def line_value(line):
+    c=[line.get('stat_value'),line.get('line'),line.get('value')]
+    ou=line.get('over_under') if isinstance(line.get('over_under'),dict) else {}
+    c += [ou.get('stat_value'), ou.get('line')]
+    for x in c:
+        v=sf(x)
+        if not pd.isna(v): return v
+    return np.nan
 
-    return {
-        "player": player, "matches": int(len(rows)), "surface_matches": int(len(use)), "win_pct": win_pct, "last10_win_pct": last10_win, "last25_win_pct": last25_win,
-        "rank": rank, "rank_points": rank_points, "ace_per_service_game": float(ace_sg), "ace_per_svpt": float(ace_svpt), "opponent_ace_allowed_per_service_game": float(opp_ace_allowed_sg),
-        "df_per_service_game": float(df_sg), "first_in_pct": float(first_in_pct), "first_win_pct": float(first_win_pct), "second_win_pct": float(second_win_pct),
-        "service_points_won_pct": float(service_points_won), "serve_effectiveness_pct": float(serve_effectiveness), "unreturned_serve_proxy_pct": float(unreturned_proxy),
-        "first_return_won_proxy_pct": float(first_return_won), "second_return_won_proxy_pct": float(second_return_won), "return_points_won_proxy": float(return_points_won),
-        "bp_save_pct": float(bp_save), "bp_convert_proxy_pct": float(bp_convert_proxy), "bp_created_per_return_game": float(bp_created_per_rg),
-        "hold_pct": float(hold_pct), "break_pct": float(break_pct), "return_games_won_pct": float(return_games_won_pct), "tiebreak_rate": float(tiebreak_rate), "tiebreak_win_proxy_pct": float(tiebreak_win_proxy),
-        "games_won_avg": float(games_won_avg), "games_total_avg": float(games_total_avg), "sets_avg": float(sets_avg),
-        "serve_strength": float(serve_strength), "return_strength": float(return_strength), "overall_strength": float(overall_strength),
-        "winner_proxy": float(winner_proxy), "unforced_error_proxy": float(unforced_error_proxy), "forced_error_proxy": float(forced_error_proxy), "winner_error_ratio_proxy": float(wer), "shot_quality_proxy": float(shot_quality),
-        "short_rally_edge_proxy": float(short_rally_edge), "long_rally_edge_proxy": float(long_rally_edge), "minutes_avg": minutes_avg, "matches_last14": matches_last14, "workload_index": float(workload_index), "fatigue_tax": float(fatigue_tax),
-        "rest_days": rest_days, "elite_tag": elite_tag, "reliability": float(reliability)
-    }
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_underdog():
+    last=''
+    for url in UNDERDOG_ENDPOINTS:
+        try:
+            r=requests.get(url, headers=HEADERS, timeout=12)
+            if r.status_code==200 and r.text.strip().startswith('{'):
+                return r.json(), url, ''
+            last=f'{url} HTTP {r.status_code}'
+        except Exception as e: last=f'{url} {str(e)[:80]}'
+    return {}, '', last
 
-# ------------------------------ Logs / learning ------------------------------
-def _mean_error(df):
-    if df is None or df.empty or "Error" not in df.columns:
-        return np.nan, 0
-    vals = pd.to_numeric(df["Error"], errors="coerce").dropna().tail(40)
-    if len(vals) < 2:
-        return np.nan, len(vals)
-    return float(vals.mean()), len(vals)
+def idx(items): return {str(x.get('id')):x for x in (items or []) if isinstance(x,dict) and x.get('id') is not None}
 
-def learning_bias(player, bucket, surface="", tourney_level="", opponent=""):
-    """Tennis learning engine. Blends player+prop, player, prop, surface and tournament-level bias.
-    Error = Actual - Projection, so a positive bias raises future projections.
-    This mirrors the MLB learning concept but is safer: it needs sample size and caps adjustments.
-    """
-    mem = read_csv_safe(LEARNING_FILE)
-    if mem.empty:
-        return 0.0, "NO_LEARNING"
-    m = mem.copy()
-    for col in ["Player", "Opponent", "Bucket", "Surface", "Tournament Level"]:
-        if col not in m.columns:
-            m[col] = ""
-    pk, ok = norm_name(player), norm_name(opponent)
-    b = str(bucket)
-    layers = []
-    specs = [
-        ("PLY_PROP", .46, (m["Player"].map(norm_name)==pk) & (m["Bucket"].astype(str)==b)),
-        ("PLY_ALL", .18, (m["Player"].map(norm_name)==pk)),
-        ("PROP", .18, (m["Bucket"].astype(str)==b)),
-        ("SURF_PROP", .10, (m["Surface"].astype(str)==str(surface)) & (m["Bucket"].astype(str)==b)),
-        ("TOUR_PROP", .08, (m["Tournament Level"].astype(str)==str(tourney_level)) & (m["Bucket"].astype(str)==b)),
-    ]
-    # small optional opponent layer, useful for ace-allowed and break-prop tendencies
-    if ok:
-        specs.append(("OPP_PROP", .08, (m["Opponent"].map(norm_name)==ok) & (m["Bucket"].astype(str)==b)))
-    total_w, adj, labels = 0.0, 0.0, []
-    for name, w, mask in specs:
-        err, n = _mean_error(m[mask])
-        if not pd.isna(err) and n >= 3:
-            shrink = min(1.0, n / 18)
-            adj += w * shrink * err
-            total_w += w * shrink
-            labels.append(f"{name}:{err:+.2f}/{n}")
-    if total_w <= 0:
-        return 0.0, "LOW_SAMPLE"
-    raw = adj / total_w
-    cap = .95 if b in ["ACES", "PLAYER_GAMES", "BREAK_POINTS", "BREAKS", "DOUBLE_FAULTS"] else 1.45
-    bias = clamp(raw, -cap, cap)
-    return bias, " | ".join(labels[:3])
+def parse_underdog(payload):
+    if not payload: return pd.DataFrame()
+    data=payload.get('data',payload)
+    if isinstance(data,dict):
+        lines=data.get('over_under_lines') or data.get('lines') or data.get('over_unders') or []
+        apps=data.get('appearances') or [] ; players=data.get('players') or [] ; games=data.get('games') or data.get('solo_games') or []
+    elif isinstance(data,list): lines,apps,players,games=data,[],[],[]
+    else: return pd.DataFrame()
+    ai,pi,gi=idx(apps),idx(players),idx(games)
+    rows=[]
+    for line in lines:
+        if not isinstance(line,dict): continue
+        ou=line.get('over_under') if isinstance(line.get('over_under'),dict) else {}
+        ast=ou.get('appearance_stat') if isinstance(ou.get('appearance_stat'),dict) else {}
+        aid=ast.get('appearance_id') or line.get('appearance_id') or ou.get('appearance_id')
+        app=ai.get(str(aid),{}) if aid is not None else {}
+        pid=app.get('player_id') or line.get('player_id')
+        pl=pi.get(str(pid),{}) if pid is not None else {}
+        name=pl.get('display_name') or pl.get('name') or app.get('player_name') or line.get('player_name') or line.get('title') or ''
+        stat=stat_title(line); bucket=prop_bucket(stat)
+        full=(json.dumps(line)+json.dumps(app)+json.dumps(pl)).lower()
+        is_tennis=('tennis' in full or 'atp' in full or 'wta' in full or bucket in ['ACES','PLAYER_GAMES','TOTAL_GAMES','BREAK_POINTS','BREAKS','SETS','DOUBLE_FAULTS'])
+        if not is_tennis: continue
+        gid=app.get('match_id') or app.get('game_id') or line.get('game_id')
+        g=gi.get(str(gid),{}) if gid is not None else {}
+        matchup=g.get('title') or g.get('match_title') or g.get('name') or app.get('matchup') or line.get('matchup') or ''
+        rows.append({'Player':clean_name(name),'Opponent':'','Matchup':matchup,'Stat':stat,'Bucket':bucket,'UD/Line':line_value(line),'Line Source':'Underdog','Start Time':g.get('scheduled_at') or app.get('scheduled_at') or line.get('scheduled_at') or '', 'Raw ID':line.get('id',''), 'Pulled At':datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+    df=pd.DataFrame(rows)
+    if df.empty: return df
+    df=df[df['Player'].astype(str).str.len()>1].drop_duplicates(subset=['Player','Stat','UD/Line','Matchup'])
+    return df.reset_index(drop=True)
 
-def read_optional_overlay(path):
-    df = read_csv_safe(path)
-    if df.empty:
-        return df
-    if "Player" in df.columns:
-        df["PlayerKey"] = df["Player"].map(norm_name)
-    return df
+def parse_paste(text):
+    rows=[]
+    for line in str(text).splitlines():
+        s=line.strip()
+        if not s: continue
+        # formats: Taylor Fritz, Aces, 13.5, Opponent OR Taylor Fritz - Aces - 13.5 - Ben Shelton
+        parts=[p.strip() for p in re.split(r',|\s+—\s+|\s+-\s+', s) if p.strip()]
+        if len(parts)>=3:
+            player=clean_name(parts[0]); stat=parts[1]; val=sf(parts[2]); opp=clean_name(parts[3]) if len(parts)>=4 else ''
+            if player and not pd.isna(val): rows.append({'Player':player,'Opponent':opp,'Matchup':f'{player} vs {opp}' if opp else 'Manual','Stat':stat,'Bucket':prop_bucket(stat),'UD/Line':val,'Line Source':'Paste','Start Time':'','Raw ID':'','Pulled At':datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+    return pd.DataFrame(rows)
 
-def overlay_charting_metrics(summary, player, charting_df):
-    """Overlay true/free charted metrics when available.
-    Expected columns are flexible: Player plus any of Winners, Unforced Errors, Forced Errors, Rally Length, Distance Covered, Workload.
-    If absent, the app keeps transparent proxy values.
-    """
-    if charting_df is None or charting_df.empty or "PlayerKey" not in charting_df.columns:
-        summary["true_metric_source"] = "PROXY_ONLY"
-        return summary
-    sub = charting_df[charting_df["PlayerKey"] == norm_name(player)]
-    if sub.empty:
-        summary["true_metric_source"] = "PROXY_ONLY"
-        return summary
-    row = sub.tail(20)
-    def avg_any(names, default=np.nan):
-        for name in names:
-            if name in row.columns:
-                v = pd.to_numeric(row[name], errors="coerce").dropna()
-                if len(v): return float(v.mean())
-        return default
-    winners = avg_any(["Winners", "winner_count", "winners", "Winner Count"])
-    ufe = avg_any(["Unforced Errors", "unforced_errors", "UFE", "true_unforced_errors"])
-    fe = avg_any(["Forced Errors", "forced_errors", "FE", "true_forced_errors"])
-    rally = avg_any(["Rally Length", "avg_rally_length", "Average Rally", "rally_length"])
-    dist = avg_any(["Distance Covered", "distance_covered", "Distance", "meters_covered"])
-    if not pd.isna(winners): summary["winner_proxy"] = winners
-    if not pd.isna(ufe): summary["unforced_error_proxy"] = ufe
-    if not pd.isna(fe): summary["forced_error_proxy"] = fe
-    if not pd.isna(rally):
-        summary["avg_rally_length_true"] = rally
-        summary["short_rally_edge_proxy"] = clamp(8.0 - rally, 1, 10)
-        summary["long_rally_edge_proxy"] = clamp(2.0 + rally, 1, 10)
+def infer_opp(row):
+    if str(row.get('Opponent','')).strip(): return clean_name(row.get('Opponent',''))
+    m=str(row.get('Matchup',''))
+    p=norm(row.get('Player',''))
+    chunks=[clean_name(c) for c in re.split(r'\s+v(?:s\.?|ersus)?\s+| @ | / |,', m, flags=re.I) if clean_name(c)]
+    for c in chunks:
+        if norm(c)!=p and p not in norm(c): return c
+    return ''
+
+def h2h(hist, player, opp, surface='Unknown'):
+    if hist.empty or not player or not opp or 'winner_name' not in hist: return {'H2H Matches':0,'H2H Win %':50.0}
+    p=norm(player); o=norm(opp)
+    w=hist['winner_name'].astype(str).map(norm); l=hist['loser_name'].astype(str).map(norm)
+    h=hist[(w.str.contains(p,regex=False,na=False)&l.str.contains(o,regex=False,na=False)) | (w.str.contains(o,regex=False,na=False)&l.str.contains(p,regex=False,na=False))]
+    if surface!='Unknown' and 'surface' in h: 
+        hs=h[h['surface'].astype(str).str.lower()==surface.lower()]
+        if len(hs): h=hs
+    if h.empty: return {'H2H Matches':0,'H2H Win %':50.0}
+    return {'H2H Matches':int(len(h)),'H2H Win %':round(100*h['winner_name'].astype(str).map(norm).str.contains(p,regex=False,na=False).mean(),1)}
+
+def learning_bias(player,bucket,surface,level):
+    mem=read_csv(LEARNING_FILE)
+    if mem.empty or 'Error' not in mem.columns: return 0, 'NO_LEARNING'
+    mem['Error']=pd.to_numeric(mem['Error'],errors='coerce')
+    cuts=[]
+    for label,mask,minn,cap in [
+        ('PLAYER_PROP', (mem.get('Player','').astype(str).map(norm)==norm(player)) & (mem.get('Bucket','').astype(str)==bucket), 3, .55),
+        ('PROP', mem.get('Bucket','').astype(str)==bucket, 8, .30),
+        ('SURFACE', mem.get('Surface','').astype(str)==surface, 8, .20),
+        ('LEVEL', mem.get('Tournament Level','').astype(str)==level, 8, .18),
+    ]:
+        sub=mem[mask].dropna(subset=['Error']) if hasattr(mask,'__len__') else pd.DataFrame()
+        if len(sub)>=minn:
+            cuts.append((label, clamp(float(sub['Error'].tail(40).mean())*.35, -cap, cap)))
+    if not cuts: return 0, 'NO_LEARNING'
+    val=sum(x[1] for x in cuts)
+    return round(val,3), '+'.join(x[0] for x in cuts)
+
+def official_filter(bucket, edge, conf, reliability, p, opp, h2hdat, risk):
+    reasons=[]; ok=True
+    if risk: ok=False; reasons.append('RISK_FLAG')
+    if bucket=='TIEBREAK': ok=False; reasons.append('TIEBREAK_VOLATILE')
+    if bucket=='OTHER': ok=False; reasons.append('UNSUPPORTED')
+    if reliability<45: ok=False; reasons.append('LOW_SAMPLE')
+    if bucket=='ACES':
+        if abs(edge)<0.65 or conf<56: ok=False; reasons.append('ACE_EDGE_LOW')
+        if p['surface_matches']<4 and p['matches']<10: ok=False; reasons.append('ACE_SAMPLE_LOW')
+    elif bucket in ['PLAYER_GAMES','TOTAL_GAMES']:
+        if abs(edge)<0.75 or conf<57: ok=False; reasons.append('GAME_EDGE_LOW')
+    elif bucket in ['BREAKS','BREAK_POINTS','DOUBLE_FAULTS']:
+        if abs(edge)<0.70 or conf<58: ok=False; reasons.append('VOL_EDGE_LOW')
+    elif bucket=='SETS':
+        if abs(edge)<0.18 or conf<57: ok=False; reasons.append('SETS_EDGE_LOW')
+    return ('PASS' if ok else 'NO PLAY'), ('PASS' if ok else ','.join(reasons[:4]))
+
+def project(row,hist,surface,best_of,indoor,level):
+    player=row.get('Player',''); opp_name=infer_opp(row)
+    p=summarize(hist,player,surface); o=summarize(hist,opp_name,surface) if opp_name else default_summary('Unknown')
+    h=h2h(hist,player,opp_name,surface)
+    bucket=row.get('Bucket',prop_bucket(row.get('Stat',''))); line=sf(row.get('UD/Line'))
+    strength_gap=p['overall_strength']-o['overall_strength']
+    close=1-min(abs(strength_gap)/28,.38)
+    sets=2.10+.42*close if best_of==3 else 3.35+.80*close
+    if bucket=='SETS': sets=clamp(sets,2,3 if best_of==3 else 5)
+    svc_games=(5.0*sets)+(0.55*close)+(0.25 if strength_gap>4 else 0)
+    ret_games=svc_games
+    sfac=SURFACE_FACTOR.get(surface,1)*INDOOR_FACTOR.get(indoor,1)*LEVEL_FACTOR.get(level,1)
+    if bucket=='ACES':
+        opp_allow=(o['opponent_ace_allowed_per_service_game']+.55)/1.10
+        proj=p['ace_per_service_game']*svc_games*sfac*(0.94+0.12*opp_allow)*(1+p['fatigue_tax'])
+        sigma=clamp(1.15+proj*.32,1.35,4.6)
+    elif bucket=='DOUBLE_FAULTS':
+        proj=p['df_per_service_game']*svc_games*(1+max(0,o['return_points_won_pct']-.38)*.7)*(1-p['fatigue_tax'])
+        sigma=clamp(.75+proj*.45,1,3.4)
+    elif bucket=='PLAYER_GAMES':
+        proj=4.80*sets+clamp(strength_gap/18,-1.45,1.45)+.30*(p['hold_pct']-.78)*10
+        sigma=2.15 if best_of==3 else 3.35
+    elif bucket=='TOTAL_GAMES':
+        proj=9.65*sets+1.65*close-.45*abs(strength_gap)/12
+        sigma=3.3 if best_of==3 else 5.1
+    elif bucket=='BREAKS':
+        proj=(.85*sets)*(1+1.2*(p['break_pct']-.22)+.55*(1-o['hold_pct']-.22))
+        sigma=clamp(.9+proj*.55,1.1,3.6)
+    elif bucket=='BREAK_POINTS':
+        proj=p['bp_created_per_return_game']*ret_games*(1+.30*(p['return_points_won_pct']-.37))
+        sigma=clamp(1.2+proj*.45,1.4,4.2)
+    elif bucket=='SETS':
+        win_prob=sigmoid(strength_gap/8.0)
+        proj=1.0+win_prob*(1.0 if best_of==3 else 2.0)+.12*close
+        sigma=.55 if best_of==3 else .85
+    elif bucket=='MATCH_WINNER':
+        proj=sigmoid(strength_gap/8.0)*100
+        sigma=8; line=50 if pd.isna(line) else line
     else:
-        summary["avg_rally_length_true"] = np.nan
-    if not pd.isna(dist):
-        summary["distance_covered_true"] = dist
-        # More recent true physical workload raises fatigue risk if extreme.
-        summary["workload_index"] = clamp(summary.get("workload_index", 50) + max((dist - 2800)/140, 0), 1, 99)
-    else:
-        summary["distance_covered_true"] = np.nan
-    summary["winner_error_ratio_proxy"] = summary.get("winner_proxy", 1) / max(summary.get("unforced_error_proxy", 1), 1)
-    summary["true_metric_source"] = "CHARTING_OVERLAY"
-    return summary
+        proj=np.nan; sigma=2
+    lbias,lsrc=learning_bias(player,bucket,surface,level)
+    if bucket!='MATCH_WINNER' and not pd.isna(proj): proj+=lbias
+    edge=proj-line if not pd.isna(proj) and not pd.isna(line) else np.nan
+    over=prob_over(edge,sigma) if not pd.isna(edge) else np.nan; under=100-over if not pd.isna(over) else np.nan
+    dec='OVER' if edge>0 else 'UNDER' if not pd.isna(edge) else 'NO LINE'
+    conf=max(over,under) if not pd.isna(over) else np.nan
+    risk=False
+    status=read_csv(os.path.join(DATA_DIR,'status_flags.csv'))
+    if not status.empty and 'Player' in status:
+        sub=status[status['Player'].astype(str).map(norm)==norm(player)]
+        if not sub.empty and str(sub.tail(1).get('Risk Flag',pd.Series([''])).iloc[0]).upper() in ['YES','TRUE','1','RISK','INJURY','RETIREMENT']:
+            risk=True
+    reliability=min(p['reliability'], o['reliability'] if o['matches'] else p['reliability']-6)
+    official,reason=official_filter(bucket, edge if not pd.isna(edge) else 0, conf if not pd.isna(conf) else 0, reliability, p, o, h, risk)
+    grade='S 🔒' if official=='PASS' and conf>=65 and reliability>=65 else 'A' if official=='PASS' and conf>=61 else 'B' if official=='PASS' else 'C / WATCH'
+    return {**row.to_dict(),'Opponent':opp_name,'Projection':round(proj,2) if not pd.isna(proj) else np.nan,'Floor':round(proj-sigma,2) if not pd.isna(proj) else np.nan,'Median':round(proj,2) if not pd.isna(proj) else np.nan,'Ceiling':round(proj+sigma,2) if not pd.isna(proj) else np.nan,'Over Sim %':round(over,1) if not pd.isna(over) else np.nan,'Under Sim %':round(under,1) if not pd.isna(under) else np.nan,'Decision':dec,'Lean Gap':round(edge,2) if not pd.isna(edge) else np.nan,'Confidence %':round(conf,1) if not pd.isna(conf) else np.nan,'Official Filter':official,'Official Reason':reason,'Grade':grade,'Reliability':round(reliability,1),'Learning Bias':lbias,'Learning Source':lsrc,'Surface':surface,'Best Of':best_of,'Indoor':indoor,'Tournament Level':level,'Expected Sets':round(sets,2),'Expected Service Games':round(svc_games,2),'Player Matches':p['matches'],'Surface Matches':p['surface_matches'],'Rank':p['rank'],'Rank Points':p['rank_points'],'Elite Tag':p['elite_tag'],'Ace/SG':round(p['ace_per_service_game'],3),'Opp Ace Allowed/SG':round(o['opponent_ace_allowed_per_service_game'],3),'1st Serve %':round(100*p['first_in_pct'],1),'1st Won %':round(100*p['first_win_pct'],1),'2nd Won %':round(100*p['second_win_pct'],1),'Serve Pts Won %':round(100*p['service_points_won_pct'],1),'Return Pts Won %':round(100*p['return_points_won_pct'],1),'Hold %':round(100*p['hold_pct'],1),'Break %':round(100*p['break_pct'],1),'BP Save %':round(100*p['bp_save_pct'],1),'BP Convert %':round(100*p['bp_convert_pct'],1),'Winner Proxy':round(p['winner_proxy'],1),'UE Proxy':round(p['unforced_error_proxy'],1),'Forced Error Proxy':round(p['forced_error_proxy'],1),'Shot Quality':round(p['shot_quality_proxy'],1),'Workload':round(p['workload_index'],1),'Rest Days':p['rest_days'],'H2H Matches':h['H2H Matches'],'H2H Win %':h['H2H Win %']}
 
-def lookup_risk_flags(player, opponent, status_df, draw_df):
-    flags, tax, block = [], 0.0, False
-    for df, source in [(status_df, "STATUS"), (draw_df, "DRAW")]:
-        if df is None or df.empty or "PlayerKey" not in df.columns:
-            continue
-        for who in [player, opponent]:
-            if not who: continue
-            sub = df[df["PlayerKey"] == norm_name(who)]
-            if sub.empty: continue
-            row = sub.tail(1).iloc[0]
-            txt = " ".join([str(row.get(c, "")) for c in row.index]).lower()
-            if any(x in txt for x in ["retired", "withdrawn", "walkover", "out", "cancelled"]):
-                block = True; flags.append(f"{source}:{who}:BLOCK")
-            elif any(x in txt for x in ["injury", "questionable", "illness", "limited", "medical"]):
-                tax += .10; flags.append(f"{source}:{who}:RISK")
-            elif any(x in txt for x in ["confirmed", "active", "scheduled", "in draw"]):
-                flags.append(f"{source}:{who}:OK")
-    return "; ".join(flags) if flags else "NO_LIVE_FLAG", clamp(tax, 0, .25), block
+def run_engine(board,hist,surface,best_of,indoor,level):
+    if board.empty: return pd.DataFrame()
+    rows=[project(r,hist,surface,best_of,indoor,level) for _,r in board.iterrows()]
+    df=pd.DataFrame(rows)
+    if df.empty: return df
+    df['Abs Edge']=pd.to_numeric(df['Lean Gap'],errors='coerce').abs()
+    df=df.sort_values(['Official Filter','Confidence %','Abs Edge'],ascending=[True,False,False])
+    return df.reset_index(drop=True)
 
-def save_master_logs(engine_df, player_summaries):
-    if engine_df is None or engine_df.empty:
-        return
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ud_cols = ["Player", "Opponent", "Matchup", "Stat", "Bucket", "UD/Line", "Line Source", "Start Time", "Raw ID", "TENNIS PROJ", "Decision", "Confidence %", "Grade"]
-    ud_log = engine_df[[c for c in ud_cols if c in engine_df.columns]].copy()
-    ud_log["Logged At"] = now
-    append_csv(UD_LOG_FILE, ud_log)
+def render_card(r):
+    cls='good' if r.get('Official Filter')=='PASS' else 'warn'
+    st.markdown(f"""<div class='card'><div style='display:flex;justify-content:space-between'><div><b style='font-size:22px'>{r.get('Player','')} — {r.get('Stat','')}</b><div class='muted'>{r.get('Matchup','')} {('vs '+r.get('Opponent','')) if r.get('Opponent','') else ''}</div></div><div style='text-align:right'><div class='{cls}' style='font-size:24px'>{r.get('Decision','')}</div><div>{r.get('Grade','')}</div></div></div><hr><div style='display:grid;grid-template-columns:repeat(6,1fr);gap:8px'><div><span class='muted'>Proj</span><br><b>{r.get('Projection','')}</b></div><div><span class='muted'>Line</span><br><b>{r.get('UD/Line','')}</b></div><div><span class='muted'>Edge</span><br><b>{r.get('Lean Gap','')}</b></div><div><span class='muted'>Conf</span><br><b>{r.get('Confidence %','')}%</b></div><div><span class='muted'>Official</span><br><b>{r.get('Official Filter','')}</b></div><div><span class='muted'>Reliability</span><br><b>{r.get('Reliability','')}</b></div></div><div class='muted' style='margin-top:8px'>Reason: {r.get('Official Reason','')} | {r.get('Elite Tag','')}</div></div>""", unsafe_allow_html=True)
 
-    prof_rows = []
-    for name, s in player_summaries.items():
-        row = {"Player": name, "Logged At": now}
-        row.update({k: v for k, v in s.items() if k != "player"})
-        prof_rows.append(row)
-    prof = pd.DataFrame(prof_rows)
-    if not prof.empty:
-        append_csv(MASTER_LOG_FILE, prof)
-        elite = prof[["Player", "elite_tag", "rank", "rank_points", "serve_strength", "return_strength", "overall_strength", "reliability", "Logged At"]].copy()
-        write_dedup_csv(ELITE_FILE, elite, subset=["Player"])
+# SIDEBAR
+st.sidebar.header('🎾 Controls')
+years_back=st.sidebar.slider('Historical years',1,8,4)
+surface=st.sidebar.selectbox('Surface',['Grass','Hard','Clay','Carpet','Unknown'],0)
+best_of=st.sidebar.selectbox('Best of',[3,5],0)
+indoor=st.sidebar.selectbox('Indoor/Outdoor',['Outdoor','Indoor','Unknown'],0)
+level=st.sidebar.selectbox('Tournament Level',['ATP/WTA 500','Grand Slam','Masters / WTA 1000','ATP/WTA 250','Challenger / Qualifier','Unknown'],0)
+min_conf=st.sidebar.slider('Minimum confidence',50,75,54)
+official_only=st.sidebar.toggle('Official PASS only',False)
+prop_types=st.sidebar.multiselect('Prop Types',['ACES','PLAYER_GAMES','TOTAL_GAMES','SETS','BREAKS','BREAK_POINTS','DOUBLE_FAULTS','TIEBREAK','MATCH_WINNER','OTHER'],default=['ACES','PLAYER_GAMES','TOTAL_GAMES','SETS','BREAKS','DOUBLE_FAULTS'])
+force_refresh=st.sidebar.button('Refresh historical data')
 
-def grade_from_result_file(graded: pd.DataFrame, current: pd.DataFrame):
-    if graded is None or graded.empty or current is None or current.empty:
-        return pd.DataFrame()
-    need = {"Player", "Stat", "Actual"}
-    if not need.issubset(set(graded.columns)):
-        return pd.DataFrame()
-    g = graded.copy()
-    g["PlayerKey"] = g["Player"].map(norm_name)
-    current = current.copy()
-    current["PlayerKey"] = current["Player"].map(norm_name)
-    merged = current.merge(g[["PlayerKey", "Stat", "Actual"]], on=["PlayerKey", "Stat"], how="left")
-    merged["Actual"] = pd.to_numeric(merged["Actual"], errors="coerce")
-    merged["Error"] = merged["Actual"] - pd.to_numeric(merged["TENNIS PROJ"], errors="coerce")
-    def res(row):
-        if pd.isna(row["Actual"]): return ""
-        line = row.get("UD/Line", np.nan)
-        dec = row.get("Decision", "")
-        if pd.isna(line): return ""
-        if row["Actual"] == line: return "PUSH"
-        if dec == "OVER": return "WIN" if row["Actual"] > line else "LOSS"
-        if dec == "UNDER": return "WIN" if row["Actual"] < line else "LOSS"
-        return ""
-    merged["Result"] = merged.apply(res, axis=1)
-    mem_cols = ["Player", "Opponent", "Stat", "Bucket", "UD/Line", "TENNIS PROJ", "Decision", "Actual", "Error", "Result", "Surface", "Tournament Level", "Indoor/Outdoor", "Best Of", "Confidence %", "Lean Gap", "Grade", "Official Filter", "Logged At"]
-    merged["Logged At"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    append_csv(GRADE_FILE, merged[[c for c in mem_cols if c in merged.columns]])
-    append_csv(LEARNING_FILE, merged[[c for c in mem_cols if c in merged.columns]])
-    return merged
+st.markdown(f"<div class='big-title'>{APP_VERSION}</div>", unsafe_allow_html=True)
+st.markdown("<div class='sub-title'>Real ATP/WTA history + Underdog line pull + manual board fallback + tabs like MLB.</div>", unsafe_allow_html=True)
 
-# ------------------------------ Projection engine ------------------------------
-def infer_opponent(row):
-    if str(row.get("Opponent", "")).strip():
-        return clean_name(row.get("Opponent"))
-    player = norm_name(row.get("Player", ""))
-    matchup = str(row.get("Matchup", ""))
-    parts = re.split(r"\s+v(?:s\.?|ersus)?\s+| @ | - |/", matchup, flags=re.I)
-    parts = [clean_name(x) for x in parts if clean_name(x)]
-    for p in parts:
-        n = norm_name(p)
-        if n and n != player and player not in n and n not in player:
-            return p
-    return ""
+hist, hist_source, hist_err = load_history(years_back, force_refresh)
+payload, ud_url, ud_err = fetch_underdog()
+ud_board=parse_underdog(payload)
+if not ud_board.empty: append_csv(UD_LOG_FILE, ud_board)
 
-def expected_sets(best_of, p, opp, h2h_win=50):
-    gap = p["overall_strength"] - opp["overall_strength"]
-    h2h_adj = (h2h_win - 50) / 100
-    close = 1 - min(abs(gap + h2h_adj * 5) / 18, .45)
-    if best_of == 5:
-        return clamp(3.18 + 1.12 * close, 3.02, 4.75)
-    return clamp(2.01 + .58 * close, 2.00, 2.95)
-
-def straight_set_probability(best_of, p, opp):
-    gap = abs(p["overall_strength"] - opp["overall_strength"])
-    if best_of == 5:
-        return clamp(.18 + gap / 55, .12, .54)
-    return clamp(.39 + gap / 42, .36, .76)
-
-def three_set_probability(best_of, p, opp):
-    if best_of != 3:
-        return 0.0
-    return round(100 * (1 - straight_set_probability(best_of, p, opp)), 1)
-
-def expected_match_games(best_of, p, opp, surface, h2h_win=50):
-    sets = expected_sets(best_of, p, opp, h2h_win)
-    hold_combo = (p["hold_pct"] + opp["hold_pct"]) / 2
-    close = 1 - min(abs(p["overall_strength"] - opp["overall_strength"]) / 18, .45)
-    surface_game = .65 if surface == "Grass" else (-.38 if surface == "Clay" else 0)
-    return clamp(9.30 * sets + 2.35 * close + 3.85 * (hold_combo - .76) + surface_game, 17 if best_of == 3 else 28, 35 if best_of == 3 else 60)
-
-def official_gate(bucket, edge, conf, rel, vol, line, p, opp):
-    if bucket == "TIEBREAK":
-        # allow only very strict tiebreak setups as WATCH, not official lock
-        hold_combo = (p["hold_pct"] + opp["hold_pct"]) / 2
-        if hold_combo >= .84 and abs(edge) >= .22 and conf >= 60:
-            return False, "WATCH ONLY — elite hold profile but tiebreak still volatile"
-        return False, "TIEBREAK FADE/WATCH — high variance"
-    if bucket == "OTHER":
-        return False, "Unsupported prop"
-    if pd.isna(edge) or pd.isna(conf):
-        return False, "Missing line/projection"
-    absedge = abs(edge)
-    if bucket == "ACES" and absedge >= .55 and conf >= 56 and rel >= 45:
-        return True, "PASS — Aces main market with volume support"
-    if bucket == "PLAYER_GAMES" and absedge >= .65 and conf >= 57 and rel >= 47:
-        return True, "PASS — Player games main market"
-    if bucket == "TOTAL_GAMES" and absedge >= .90 and conf >= 59 and rel >= 52 and vol <= 1.42:
-        return True, "PASS — Total games qualified"
-    if bucket in ["BREAK_POINTS", "BREAKS"] and absedge >= .80 and conf >= 60 and rel >= 55 and vol <= 1.58:
-        return True, "PASS — Break market qualified"
-    if bucket == "DOUBLE_FAULTS" and absedge >= .45 and conf >= 58 and rel >= 50:
-        return True, "PASS — Double faults qualified"
-    if bucket == "FANTASY_POINTS" and absedge >= 1.10 and conf >= 59 and rel >= 52:
-        return True, "PASS — Fantasy points qualified"
-    return False, "NO PLAY — edge/conf/reliability short"
-
-def grade(conf, official, volatility, reliability):
-    if not official:
-        return "C / WATCH"
-    if conf >= 68 and volatility <= 1.20 and reliability >= 62:
-        return "S 🔒"
-    if conf >= 63 and reliability >= 55:
-        return "A"
-    if conf >= 58:
-        return "B"
-    return "C"
-
-def project(row, p, opp, h2h, surface, indoor, tourney_level, best_of):
-    bucket = row.get("Bucket", "OTHER")
-    line = safe_float(row.get("UD/Line"))
-    surf = SURFACE_FACTOR.get(surface, 1.0)
-    indoor_f = INDOOR_FACTOR.get(indoor, 1.0)
-    level_f = TOURNEY_LEVEL_FACTOR.get(tourney_level, 1.0)
-    h2h_win = h2h.get("H2H Win %", 50.0)
-    sets = expected_sets(best_of, p, opp, h2h_win)
-    match_games = expected_match_games(best_of, p, opp, surface, h2h_win)
-    player_service_games = match_games / 2 + clamp((p["overall_strength"] - opp["overall_strength"]) / 18, -1.15, 1.15)
-    player_return_games = match_games / 2
-    strength_gap = p["overall_strength"] - opp["overall_strength"]
-    serve_gap = p["serve_strength"] - opp["return_strength"]
-    return_gap = p["return_strength"] - opp["serve_strength"]
-    h2h_edge = clamp((h2h_win - 50) / 20, -1.0, 1.0) if h2h.get("H2H Matches", 0) >= 2 else 0.0
-    learning_adj, learning_label = learning_bias(row.get("Player", ""), bucket, surface, tourney_level, row.get("Opponent", ""))
-    clv_adj, clv_label = clv_signal(row.get("Player", ""), bucket)
-    sample_conf_tax, sample_rel_tax, sample_block, sample_note = sample_size_gate(bucket, p, opp)
-    risk_label = row.get("Risk Flags", "NO_LIVE_FLAG")
-    risk_tax = safe_float(row.get("Risk Tax", 0.0), 0.0)
-    risk_block = bool(row.get("Risk Block", False))
-
-    fatigue_factor = 1 + p.get("fatigue_tax", 0.0)
-    opp_ace_allow_factor = clamp(1 + (opp["opponent_ace_allowed_per_service_game"] - .52) * .42, .88, 1.18)
-
-    if bucket == "ACES":
-        proj = p["ace_per_service_game"] * player_service_games * surf * indoor_f * opp_ace_allow_factor * (1 + .035 * serve_gap / 10) * fatigue_factor
-        sigma = clamp(1.05 + proj * .34, 1.25, 5.2)
-    elif bucket == "DOUBLE_FAULTS":
-        proj = p["df_per_service_game"] * player_service_games * (1 + .04 * max(opp["return_strength"] - 41, 0) / 10) * (1 - p.get("fatigue_tax", 0.0))
-        sigma = clamp(.75 + proj * .45, .85, 3.8)
-    elif bucket == "PLAYER_GAMES":
-        proj = (match_games / 2) + clamp(strength_gap / 12, -2.25, 2.25) + .25 * h2h_edge
-        sigma = 2.10 if best_of == 3 else 3.60
-    elif bucket == "TOTAL_GAMES":
-        proj = match_games
-        sigma = 3.30 if best_of == 3 else 5.45
-    elif bucket == "BREAK_POINTS":
-        opp_bp_faced_rate = clamp(opp["bp_created_per_return_game"] + (1 - opp["hold_pct"]) * .33, .32, .82)
-        proj = player_return_games * opp_bp_faced_rate * (1 + .055 * return_gap / 10) * level_f
-        sigma = clamp(1.20 + proj * .50, 1.35, 5.2)
-    elif bucket == "BREAKS":
-        break_chance = clamp(p["break_pct"] + .015 * return_gap / 10 + .01 * h2h_edge, .06, .50)
-        proj = player_return_games * break_chance * level_f
-        sigma = clamp(.95 + proj * .58, 1.05, 4.5)
-    elif bucket == "TIEBREAK":
-        hold_combo = (p["hold_pct"] + opp["hold_pct"]) / 2
-        tb_rate = (p["tiebreak_rate"] + opp["tiebreak_rate"]) / 2
-        proj = clamp(.10 + .62 * tb_rate + .72 * max(hold_combo - .78, 0) + (.08 if surface == "Grass" else 0), .04, 1.20)
-        sigma = .78
-    elif bucket == "FANTASY_POINTS":
-        ace_component = p["ace_per_service_game"] * player_service_games * surf * indoor_f * opp_ace_allow_factor
-        games_component = (match_games / 2) + clamp(strength_gap / 12, -2.25, 2.25)
-        breaks_component = player_return_games * clamp(p["break_pct"] + .015 * return_gap / 10, .06, .50)
-        proj = games_component + .85 * ace_component + 1.15 * breaks_component + 2.0 * sigmoid(strength_gap / 8)
-        sigma = clamp(2.4 + proj * .13, 2.8, 6.8)
-    else:
-        proj, sigma = np.nan, 2.0
-
-    if not pd.isna(proj):
-        proj += learning_adj
-    edge = proj - line if not pd.isna(proj) and not pd.isna(line) else np.nan
-    over = normal_prob_over(edge, sigma)
-    under = 100 - over if not pd.isna(over) else np.nan
-    conf = max(over, under) if not pd.isna(over) else np.nan
-    decision = "OVER" if not pd.isna(edge) and edge > 0 else ("UNDER" if not pd.isna(edge) else "NO PLAY")
-    if not pd.isna(conf):
-        conf = clamp(conf + clv_adj - sample_conf_tax, 0, 99)
-    vol = round(clamp(sigma / max(abs(proj), 1), .45, 2.55) + (.18 if bucket in ["TIEBREAK", "BREAK_POINTS", "BREAKS"] else 0), 2)
-    rel = min(p["reliability"], opp["reliability"] if opp["matches"] else p["reliability"] - 8)
-    rel = max(0, rel - sample_rel_tax)
-    official, reason = official_gate(bucket, edge, conf, rel, vol, line, p, opp)
-    if sample_block:
-        official, reason = False, "NO PLAY — sample-size gate: " + sample_note
-    if risk_block:
-        official, reason = False, "NO PLAY — live status/draw block: " + str(risk_label)
-    elif risk_tax > 0:
-        conf = max(0, conf - risk_tax * 100) if not pd.isna(conf) else conf
-        rel = max(0, rel - risk_tax * 75)
-        if official and risk_tax >= .10:
-            official, reason = False, "WATCH — injury/status risk tax: " + str(risk_label)
-
-    return {
-        "TENNIS PROJ": round(proj, 2) if not pd.isna(proj) else np.nan,
-        "Floor": round(proj - sigma, 2) if not pd.isna(proj) else np.nan,
-        "Median": round(proj, 2) if not pd.isna(proj) else np.nan,
-        "Ceiling": round(proj + sigma, 2) if not pd.isna(proj) else np.nan,
-        "Volatility": vol, "Over Sim %": round(over, 1) if not pd.isna(over) else np.nan, "Under Sim %": round(under, 1) if not pd.isna(under) else np.nan,
-        "Decision": decision, "Model Lean": decision, "Lean Gap": round(edge, 2) if not pd.isna(edge) else np.nan,
-        "Confidence %": round(conf, 1) if not pd.isna(conf) else np.nan, "Reliability": round(rel, 1),
-        "Official Filter": "PASS" if official else "NO PLAY", "Official Reason": reason, "Grade": grade(conf if not pd.isna(conf) else 0, official, vol, rel),
-        "Learning Adj": round(learning_adj, 2), "Learning Label": learning_label, "CLV Adj": round(clv_adj, 2), "CLV Label": clv_label, "Sample Gate": sample_note,
-        "Expected Sets": round(sets, 2), "3 Set Prob %": three_set_probability(best_of, p, opp), "Straight Set Prob %": round(100 * straight_set_probability(best_of, p, opp), 1),
-        "Expected Match Games": round(match_games, 2), "Expected Service Games": round(player_service_games, 2), "Expected Return Games": round(player_return_games, 2),
-        "Surface": surface, "Indoor/Outdoor": indoor, "Tournament Level": tourney_level, "Best Of": best_of,
-        "Rank": p["rank"], "Rank Points": p["rank_points"], "Elite Tag": p["elite_tag"], "Player Win %": round(100*p["win_pct"], 1), "Last10 Win %": round(100*p["last10_win_pct"], 1), "Last25 Win %": round(100*p["last25_win_pct"], 1),
-        "Aces/Service Game": round(p["ace_per_service_game"], 3), "Opponent Ace Allowed/SG": round(opp["opponent_ace_allowed_per_service_game"], 3), "DF/Service Game": round(p["df_per_service_game"], 3),
-        "1st Serve In %": round(100*p["first_in_pct"], 1), "1st Serve Won %": round(100*p["first_win_pct"], 1), "2nd Serve Won %": round(100*p["second_win_pct"], 1), "Service Points Won %": round(100*p["service_points_won_pct"], 1),
-        "Serve Effectiveness %": round(100*p["serve_effectiveness_pct"], 1), "Unreturned Serve Proxy %": round(100*p["unreturned_serve_proxy_pct"], 1),
-        "1st Return Won Proxy %": round(100*p["first_return_won_proxy_pct"], 1), "2nd Return Won Proxy %": round(100*p["second_return_won_proxy_pct"], 1), "Return Points Won %": round(100*p["return_points_won_proxy"], 1),
-        "BP Save %": round(100*p["bp_save_pct"], 1), "BP Convert Proxy %": round(100*p["bp_convert_proxy_pct"], 1), "BP Created/Return Game": round(p["bp_created_per_return_game"], 3),
-        "Hold %": round(100*p["hold_pct"], 1), "Break %": round(100*p["break_pct"], 1), "Return Games Won %": round(100*p["return_games_won_pct"], 1), "Tiebreak Rate": round(100*p["tiebreak_rate"], 1), "Tiebreak Win Proxy %": round(100*p["tiebreak_win_proxy_pct"], 1),
-        "Winner Proxy": round(p["winner_proxy"], 1), "Unforced Error Proxy": round(p["unforced_error_proxy"], 1), "Forced Error Proxy": round(p["forced_error_proxy"], 1), "Winner/Error Ratio Proxy": round(p["winner_error_ratio_proxy"], 2), "Shot Quality Proxy": round(p["shot_quality_proxy"], 1),
-        "Short Rally Edge Proxy": round(p["short_rally_edge_proxy"], 1), "Long Rally Edge Proxy": round(p["long_rally_edge_proxy"], 1), "Avg Rally Length True": p.get("avg_rally_length_true", np.nan), "Distance Covered True": p.get("distance_covered_true", np.nan), "True Metric Source": p.get("true_metric_source", "PROXY_ONLY"), "Risk Flags": risk_label, "Risk Tax": round(risk_tax, 3), "Workload Index": round(p["workload_index"], 1), "Matches Last 14": p["matches_last14"], "Rest Days": p["rest_days"], "Fatigue Tax": round(p["fatigue_tax"], 3),
-        "Serve Strength": round(p["serve_strength"], 1), "Return Strength": round(p["return_strength"], 1), "Overall Strength": round(p["overall_strength"], 1), "Opponent Strength": round(opp["overall_strength"], 1),
-        "H2H Matches": h2h.get("H2H Matches", 0), "H2H Win %": h2h.get("H2H Win %", 50.0), "H2H Surface Matches": h2h.get("H2H Surface Matches", 0),
-        "Player Matches": p["matches"], "Surface Matches": p["surface_matches"], "Opp Matches": opp["matches"],
-    }
-
-def build_engine(lines, matches, surface, indoor, tourney_level, best_of, charting_df=None, status_df=None, draw_df=None):
-    rows, summaries = [], {}
-    for _, r in lines.iterrows():
-        base = r.to_dict()
-        base["Player"] = clean_name(base.get("Player"))
-        base["Opponent"] = infer_opponent(base)
-        base["Bucket"] = base.get("Bucket") or prop_bucket(base.get("Stat", ""))
-        p = summarize(matches, base["Player"], surface)
-        opp = summarize(matches, base["Opponent"], surface) if base["Opponent"] else default_summary("Unknown")
-        p = overlay_charting_metrics(p, base["Player"], charting_df)
-        if base["Opponent"]:
-            opp = overlay_charting_metrics(opp, base["Opponent"], charting_df)
-        flags, tax, block = lookup_risk_flags(base["Player"], base["Opponent"], status_df, draw_df)
-        base["Risk Flags"], base["Risk Tax"], base["Risk Block"] = flags, tax, block
-        h2h = h2h_summary(matches, base["Player"], base["Opponent"], surface) if base["Opponent"] else {"H2H Matches":0,"H2H Win %":50.0,"H2H Surface Matches":0}
-        summaries[base["Player"]] = p
-        if base["Opponent"]:
-            summaries[base["Opponent"]] = opp
-        base.update(project(base, p, opp, h2h, surface, indoor, tourney_level, best_of))
-        rows.append(base)
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df, summaries
-    df["Abs Edge"] = pd.to_numeric(df["Lean Gap"], errors="coerce").abs()
-    return df.sort_values(["Official Filter", "Confidence %", "Abs Edge"], ascending=[True, False, False]).reset_index(drop=True), summaries
-
-# ------------------------------ Render helpers ------------------------------
-def render_card(r: pd.Series):
-    cls = "good" if r.get("Official Filter") == "PASS" else "warn"
-    st.markdown(f"""
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <div><div style="font-size:23px;font-weight:900;">{r.get('Player','')} — {r.get('Stat','')}</div><div class="muted">{r.get('Matchup','')} {('vs ' + str(r.get('Opponent',''))) if r.get('Opponent','') else ''}</div></div>
-        <div style="text-align:right;"><div class="{cls}" style="font-size:24px;">{r.get('Decision','')}</div><div class="muted">{r.get('Grade','')} · {r.get('Official Filter','')}</div></div>
-      </div>
-      <hr style="border-color:#23313d;">
-      <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:10px;">
-        <div><div class="muted">Proj</div><div style="font-size:22px;font-weight:900;">{r.get('TENNIS PROJ','')}</div></div>
-        <div><div class="muted">UD Line</div><div style="font-size:22px;font-weight:900;">{r.get('UD/Line','')}</div></div>
-        <div><div class="muted">Edge</div><div style="font-size:22px;font-weight:900;">{r.get('Lean Gap','')}</div></div>
-        <div><div class="muted">Conf</div><div style="font-size:22px;font-weight:900;">{r.get('Confidence %','')}%</div></div>
-        <div><div class="muted">Volume</div><div style="font-size:22px;font-weight:900;">{r.get('Expected Service Games','')}</div></div>
-        <div><div class="muted">Elite</div><div style="font-size:13px;font-weight:900;">{r.get('Elite Tag','')}</div></div>
-      </div>
-      <div class="muted" style="margin-top:9px;">{r.get('Official Reason','')} · Learning: {r.get('Learning Label','')} · CLV: {r.get('CLV Label','')} · Sample: {r.get('Sample Gate','')}</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-def show_table(df):
-    preferred = [
-        "Player", "Opponent", "Matchup", "Stat", "Bucket", "TENNIS PROJ", "Floor", "Median", "Ceiling", "Volatility", "Over Sim %", "Under Sim %", "UD/Line", "Decision", "Lean Gap", "Confidence %", "Grade", "Official Filter", "Official Reason",
-        "Expected Sets", "3 Set Prob %", "Straight Set Prob %", "Expected Match Games", "Expected Service Games", "Surface", "Indoor/Outdoor", "Tournament Level", "Best Of", "Elite Tag",
-        "Rank", "Rank Points", "Player Win %", "Last10 Win %", "Last25 Win %", "Aces/Service Game", "Opponent Ace Allowed/SG", "DF/Service Game", "1st Serve In %", "1st Serve Won %", "2nd Serve Won %", "Service Points Won %", "Serve Effectiveness %", "Unreturned Serve Proxy %",
-        "1st Return Won Proxy %", "2nd Return Won Proxy %", "Return Points Won %", "BP Save %", "BP Convert Proxy %", "BP Created/Return Game", "Hold %", "Break %", "Return Games Won %", "Tiebreak Rate", "Tiebreak Win Proxy %",
-        "Winner Proxy", "Unforced Error Proxy", "Forced Error Proxy", "Winner/Error Ratio Proxy", "Shot Quality Proxy", "Short Rally Edge Proxy", "Long Rally Edge Proxy", "Avg Rally Length True", "Distance Covered True", "True Metric Source", "Risk Flags", "Risk Tax", "Workload Index", "Matches Last 14", "Rest Days", "Fatigue Tax",
-        "Serve Strength", "Return Strength", "Overall Strength", "Opponent Strength", "H2H Matches", "H2H Win %", "Player Matches", "Surface Matches", "Opp Matches", "Learning Adj", "CLV Adj", "CLV Label", "Sample Gate"
-    ]
-    use = [c for c in preferred if c in df.columns]
-    st.dataframe(df[use], use_container_width=True, height=520)
-
-# ------------------------------ Sidebar / app ------------------------------
-st.sidebar.markdown("## 🎾 Tennis Engine Controls")
-surface = st.sidebar.selectbox("Surface", ["Hard", "Clay", "Grass", "Carpet", "Unknown"], index=0)
-indoor = st.sidebar.selectbox("Indoor / Outdoor", ["Outdoor", "Indoor", "Unknown"], index=0)
-tourney_level = st.sidebar.selectbox("Tournament Level", list(TOURNEY_LEVEL_FACTOR.keys()), index=5)
-best_of = st.sidebar.selectbox("Best of", [3, 5], index=0)
-years_back = st.sidebar.slider("Historical years", 1, 8, 4)
-min_conf = st.sidebar.slider("Minimum confidence", 50, 78, 54)
-official_only = st.sidebar.toggle("Official PASS only", value=False)
-prop_filter = st.sidebar.multiselect("Prop Types", ["ACES", "PLAYER_GAMES", "TOTAL_GAMES", "BREAK_POINTS", "BREAKS", "DOUBLE_FAULTS", "TIEBREAK", "FANTASY_POINTS", "OTHER"], default=["ACES", "PLAYER_GAMES", "TOTAL_GAMES", "BREAK_POINTS", "BREAKS", "DOUBLE_FAULTS"])
-page = st.sidebar.radio("Page", ["Dashboard", "Aces", "Games", "Breaks", "Elite Players", "Search", "Upload / Manual", "True Metrics / Status", "CLV Tracker", "Learning Engine", "Logs", "After Grading"])
-
-st.markdown(f'<div class="big-title">{APP_VERSION}</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">Underdog lines + ATP/WTA history + charting/status overlays + learning engine + elite tags + official filters.</div>', unsafe_allow_html=True)
-
-with st.spinner("Loading ATP/WTA historical match database..."):
-    years = list(range(CURRENT_YEAR - years_back + 1, CURRENT_YEAR + 1))
-    matches = load_matches(years)
-
-raw, ud_url, ud_err = fetch_underdog_raw()
-ud_lines = parse_underdog(raw)
-charting_overlay = read_optional_overlay(CHARTING_FILE)
-status_flags = read_optional_overlay(STATUS_FILE)
-draw_status = read_optional_overlay(DRAW_FILE)
-
-if "manual_lines" not in st.session_state:
-    st.session_state["manual_lines"] = pd.DataFrame()
-
-lines = ud_lines if not ud_lines.empty else st.session_state["manual_lines"]
-engine, summaries = build_engine(lines, matches, surface, indoor, tourney_level, best_of, charting_overlay, status_flags, draw_status) if not lines.empty else (pd.DataFrame(), {})
-
+if 'manual_board' not in st.session_state: st.session_state.manual_board=pd.DataFrame()
+board = ud_board if not ud_board.empty else st.session_state.manual_board
+engine = run_engine(board,hist,surface,best_of,indoor,level) if not board.empty else pd.DataFrame()
 if not engine.empty:
-    engine = engine[engine["Bucket"].isin(prop_filter)]
-    engine = engine[pd.to_numeric(engine["Confidence %"], errors="coerce").fillna(0) >= min_conf]
-    if official_only:
-        engine = engine[engine["Official Filter"] == "PASS"]
+    engine=engine[engine['Bucket'].isin(prop_types)]
+    engine=engine[pd.to_numeric(engine['Confidence %'],errors='coerce').fillna(0)>=min_conf]
+    if official_only: engine=engine[engine['Official Filter']=='PASS']
+    master_cols=['Player','Rank','Rank Points','Elite Tag','Player Matches','Surface Matches','Ace/SG','1st Serve %','Serve Pts Won %','Return Pts Won %','Hold %','Break %','Workload','Rest Days']
+    append_csv(MASTER_FILE, engine[[c for c in master_cols if c in engine.columns]].drop_duplicates('Player'))
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Underdog Lines", len(ud_lines))
-c2.metric("Historical Matches", len(matches))
-c3.metric("Official PASS", int((engine["Official Filter"] == "PASS").sum()) if not engine.empty else 0)
-c4.metric("Elite Profiles", len([s for s in summaries.values() if s.get("elite_tag") not in ["STANDARD", "UNKNOWN_SAMPLE"]]))
+k1,k2,k3,k4,k5=st.columns(5)
+for col,label,val in [(k1,'Underdog Lines',len(ud_board)),(k2,'Historical Matches',len(hist)),(k3,'Board Lines',len(board)),(k4,'Official PASS',int((engine.get('Official Filter',pd.Series([]))=='PASS').sum()) if not engine.empty else 0),(k5,'Elite Profiles',engine['Elite Tag'].astype(str).str.contains('ELITE|TOP_25',na=False).sum() if not engine.empty else 0)]:
+    col.markdown(f"<div class='kpi'><div class='kpi-v'>{val}</div><div class='kpi-l'>{label}</div></div>", unsafe_allow_html=True)
 
-if not ud_lines.empty:
-    st.success(f"Underdog connected: {ud_url}")
-    if st.button("Save Underdog + Player Master Logs"):
-        save_master_logs(engine, summaries)
-        st.success("Saved master player stats, elite tags, and Underdog line history.")
-else:
-    st.warning(f"No Underdog tennis board found right now. Use Upload / Manual. Last error: {ud_err}")
+if hist.empty: st.error('Historical matches are 0. Open Data Health tab and use Manual Board until data source is reachable.')
+elif hist_source!='JEFF_SACKMANN_GITHUB': st.warning(f'History source: {hist_source}. {hist_err}')
+if ud_board.empty: st.warning(f'No Underdog tennis board found from public endpoint. Use Upload / Manual tab. Last error: {ud_err}')
 
-if page == "Dashboard":
-    st.markdown("### 🟢 Best Board")
-    if engine.empty:
-        st.info("No current board loaded. Use Upload / Manual if Underdog has no active tennis lines.")
+tabs=st.tabs(['🏠 Dashboard','🎯 Aces','🎾 Games/Sets','💥 Breaks/DF','⬆️ Upload / Manual','🩺 Data Health','✅ Grade + Learning','📚 Logs'])
+with tabs[0]:
+    st.subheader('🟢 Best Board')
+    if engine.empty: st.info('No current board loaded. Go to Upload / Manual and paste Underdog lines or upload CSV.')
     else:
-        for _, r in engine.head(8).iterrows():
-            render_card(r)
-        st.markdown("### Full Projection Board")
-        show_table(engine)
-        if st.button("Save Projection Snapshot"):
-            snap = engine.copy(); snap["Saved At"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            append_csv(SNAPSHOT_FILE, snap)
-            save_master_logs(engine, summaries)
-            st.success("Snapshot + logs saved.")
-
-elif page == "Aces":
-    st.markdown("### 🎯 Aces Engine")
-    show_table(engine[engine["Bucket"] == "ACES"] if not engine.empty else pd.DataFrame())
-
-elif page == "Games":
-    st.markdown("### 🎾 Games Engine")
-    show_table(engine[engine["Bucket"].isin(["PLAYER_GAMES", "TOTAL_GAMES"])] if not engine.empty else pd.DataFrame())
-
-elif page == "Breaks":
-    st.markdown("### 🔁 Breaks / Break Points Engine")
-    show_table(engine[engine["Bucket"].isin(["BREAK_POINTS", "BREAKS"])] if not engine.empty else pd.DataFrame())
-
-elif page == "Elite Players":
-    st.markdown("### ⭐ Elite Player Tags")
-    prof = pd.DataFrame([{**{"Player": k}, **v} for k, v in summaries.items()]) if summaries else read_csv_safe(ELITE_FILE)
-    if prof.empty:
-        st.info("No elite profile log yet. Run a board and save logs.")
-    else:
-        cols = ["Player", "elite_tag", "rank", "rank_points", "serve_strength", "return_strength", "overall_strength", "service_points_won_pct", "return_points_won_proxy", "hold_pct", "break_pct", "shot_quality_proxy", "workload_index", "reliability"]
-        cols = [c for c in cols if c in prof.columns]
-        st.dataframe(prof[cols].sort_values(cols[-1] if cols else "Player", ascending=False), use_container_width=True, height=520)
-
-elif page == "Search":
-    st.markdown("### 🔎 Search")
-    q = st.text_input("Search player, matchup, prop")
-    if q and not engine.empty:
-        df = engine[engine.astype(str).apply(lambda col: col.str.contains(q, case=False, na=False)).any(axis=1)]
-        for _, r in df.head(10).iterrows():
-            render_card(r)
-        show_table(df)
-
-elif page == "Upload / Manual":
-    st.markdown("### Upload / Manual Board")
-    st.caption("Required CSV columns: Player, Stat, UD/Line. Optional: Opponent, Matchup.")
-    f = st.file_uploader("Upload Tennis Lines CSV", type=["csv"])
+        for _,r in engine.head(10).iterrows(): render_card(r)
+        st.dataframe(engine, use_container_width=True, height=420)
+        if st.button('Save Projection Snapshot'):
+            snap=engine.copy(); snap['Saved At']=datetime.now().strftime('%Y-%m-%d %H:%M:%S'); append_csv(SNAPSHOT_FILE,snap); st.success('Saved.')
+with tabs[1]:
+    df=engine[engine['Bucket']=='ACES'] if not engine.empty else pd.DataFrame(); st.dataframe(df,use_container_width=True,height=600)
+with tabs[2]:
+    df=engine[engine['Bucket'].isin(['PLAYER_GAMES','TOTAL_GAMES','SETS','MATCH_WINNER'])] if not engine.empty else pd.DataFrame(); st.dataframe(df,use_container_width=True,height=600)
+with tabs[3]:
+    df=engine[engine['Bucket'].isin(['BREAKS','BREAK_POINTS','DOUBLE_FAULTS','TIEBREAK'])] if not engine.empty else pd.DataFrame(); st.dataframe(df,use_container_width=True,height=600)
+with tabs[4]:
+    st.subheader('Manual / Upload Board')
+    st.caption('CSV columns: Player, Stat, UD/Line. Optional: Opponent, Matchup. Paste format: Taylor Fritz, Aces, 13.5, Ben Shelton')
+    paste=st.text_area('Paste Underdog lines', height=150, placeholder='Taylor Fritz, Aces, 13.5, Ben Shelton\nBen Shelton, Sets Won, 0.5, Taylor Fritz\nTaylor Fritz, Games Played, 26.5, Ben Shelton')
+    c1,c2,c3=st.columns(3)
+    if c1.button('Load pasted board'):
+        df=parse_paste(paste)
+        if not df.empty: st.session_state.manual_board=df; st.success(f'Loaded {len(df)} lines.'); st.rerun()
+        else: st.error('No valid lines found.')
+    if c2.button('Load sample from screenshot'):
+        st.session_state.manual_board=pd.DataFrame([
+            {'Player':'Taylor Fritz','Opponent':'Ben Shelton','Matchup':'Ben Shelton vs Taylor Fritz','Stat':'Aces','Bucket':'ACES','UD/Line':13.5,'Line Source':'Sample','Start Time':'','Raw ID':'','Pulled At':datetime.now().strftime('%Y-%m-%d %H:%M:%S')},
+            {'Player':'Taylor Fritz','Opponent':'Ben Shelton','Matchup':'Ben Shelton vs Taylor Fritz','Stat':'Sets Won','Bucket':'SETS','UD/Line':0.5,'Line Source':'Sample','Start Time':'','Raw ID':'','Pulled At':datetime.now().strftime('%Y-%m-%d %H:%M:%S')},
+            {'Player':'Ben Shelton','Opponent':'Taylor Fritz','Matchup':'Ben Shelton vs Taylor Fritz','Stat':'Sets Won','Bucket':'SETS','UD/Line':0.5,'Line Source':'Sample','Start Time':'','Raw ID':'','Pulled At':datetime.now().strftime('%Y-%m-%d %H:%M:%S')},
+            {'Player':'Taylor Fritz','Opponent':'Ben Shelton','Matchup':'Ben Shelton vs Taylor Fritz','Stat':'Games Played','Bucket':'TOTAL_GAMES','UD/Line':26.5,'Line Source':'Sample','Start Time':'','Raw ID':'','Pulled At':datetime.now().strftime('%Y-%m-%d %H:%M:%S')},
+            {'Player':'Alexander Zverev','Opponent':'Raphael Collignon','Matchup':'Alexander Zverev vs Raphael Collignon','Stat':'Match Winner','Bucket':'MATCH_WINNER','UD/Line':50,'Line Source':'Sample','Start Time':'','Raw ID':'','Pulled At':datetime.now().strftime('%Y-%m-%d %H:%M:%S')},
+        ]); st.success('Loaded screenshot sample.'); st.rerun()
+    if c3.button('Clear manual board'):
+        st.session_state.manual_board=pd.DataFrame(); st.rerun()
+    f=st.file_uploader('Upload board CSV', type=['csv'])
     if f is not None:
-        df = pd.read_csv(f)
-        if {"Player", "Stat", "UD/Line"}.issubset(df.columns):
-            if "Opponent" not in df.columns: df["Opponent"] = ""
-            if "Matchup" not in df.columns: df["Matchup"] = ""
-            df["Bucket"] = df["Stat"].map(prop_bucket)
-            df["Line Source"] = "Manual/Upload"
-            df["Pulled At"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            st.session_state["manual_lines"] = df
-            st.success("Manual board loaded.")
-            st.dataframe(df, use_container_width=True)
-        else:
-            st.error("CSV needs Player, Stat, UD/Line.")
-    with st.form("manual_add"):
-        p = st.text_input("Player")
-        o = st.text_input("Opponent")
-        stat = st.selectbox("Prop", ["Aces", "Games Won", "Total Games", "Break Points Won", "Breaks", "Double Faults", "Tiebreaks", "Fantasy Points"])
-        line = st.number_input("Underdog Line", min_value=0.0, value=4.5, step=.5)
-        matchup = st.text_input("Matchup")
-        ok = st.form_submit_button("Add")
-        if ok:
-            new = pd.DataFrame([{"Player": clean_name(p), "Opponent": clean_name(o), "Matchup": matchup, "Stat": stat, "Bucket": prop_bucket(stat), "UD/Line": line, "Line Source": "Manual", "Pulled At": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}])
-            st.session_state["manual_lines"] = pd.concat([st.session_state["manual_lines"], new], ignore_index=True)
-            st.success("Added manual line.")
-    if not st.session_state["manual_lines"].empty:
-        st.dataframe(st.session_state["manual_lines"], use_container_width=True)
-        if st.button("Clear Manual Lines"):
-            st.session_state["manual_lines"] = pd.DataFrame(); st.rerun()
-
-elif page == "True Metrics / Status":
-    st.markdown("### 🎾 True Metrics / Live Status Overlay")
-    st.caption("Free/realistic layer. Upload Tennis Abstract charting-style data or your own CSV. These true values override proxy winners/errors/rally/distance when available.")
-    tab_a, tab_b, tab_c, tab_d = st.tabs(["Charting True Metrics", "Injury / Retirement Flags", "Draw / Match Status", "Remote CSV Import"])
-    with tab_a:
-        st.write("Accepted columns: Player, Winners, Unforced Errors, Forced Errors, Rally Length, Distance Covered. Extra columns are kept.")
-        f = st.file_uploader("Upload charting true metrics CSV", type=["csv"], key="charting_upload")
-        if f is not None:
-            df = pd.read_csv(f)
-            if "Player" in df.columns:
-                write_dedup_csv(CHARTING_FILE, df, subset=["Player"] if "Date" not in df.columns else ["Player", "Date"])
-                st.success("Charting/true metric overlay saved.")
-            else:
-                st.error("CSV needs a Player column.")
-        st.dataframe(read_csv_safe(CHARTING_FILE).tail(300), use_container_width=True, height=360)
-    with tab_b:
-        st.write("Use this free fallback for live injuries/retirements when no paid API is connected. Status examples: Active, Questionable, Injury, Retired, Withdrawn.")
-        f = st.file_uploader("Upload status flags CSV", type=["csv"], key="status_upload")
-        if f is not None:
-            df = pd.read_csv(f)
-            if "Player" in df.columns:
-                write_dedup_csv(STATUS_FILE, df, subset=["Player"])
-                st.success("Status flags saved.")
-            else:
-                st.error("CSV needs a Player column.")
-        st.dataframe(read_csv_safe(STATUS_FILE).tail(300), use_container_width=True, height=360)
-    with tab_c:
-        st.write("Use this for official draw/match status. Status examples: Scheduled, Confirmed, In Draw, Withdrawn, Walkover, Cancelled.")
-        f = st.file_uploader("Upload draw status CSV", type=["csv"], key="draw_upload")
-        if f is not None:
-            df = pd.read_csv(f)
-            if "Player" in df.columns:
-                write_dedup_csv(DRAW_FILE, df, subset=["Player"] if "Tournament" not in df.columns else ["Player", "Tournament"])
-                st.success("Draw status saved.")
-            else:
-                st.error("CSV needs a Player column.")
-        st.dataframe(read_csv_safe(DRAW_FILE).tail(300), use_container_width=True, height=360)
-    with tab_d:
-        st.write("Optional auto-style import: paste a raw CSV URL from GitHub or Google Sheets published as CSV. This lets Streamlit refresh your free status/charting/draw sheets without paid APIs.")
-        url_type = st.selectbox("Import target", ["Charting True Metrics", "Injury / Retirement Flags", "Draw / Match Status", "Closing Lines / CLV"])
-        url = st.text_input("Raw CSV URL")
-        if st.button("Import Remote CSV"):
-            df, err = read_remote_csv(url)
-            if err or df.empty:
-                st.error(err or "No rows returned from URL.")
-            else:
-                if url_type == "Charting True Metrics":
-                    write_dedup_csv(CHARTING_FILE, df, subset=["Player"] if "Date" not in df.columns else ["Player", "Date"])
-                elif url_type == "Injury / Retirement Flags":
-                    write_dedup_csv(STATUS_FILE, df, subset=["Player"] if "Player" in df.columns else None)
-                elif url_type == "Draw / Match Status":
-                    write_dedup_csv(DRAW_FILE, df, subset=["Player"] if "Tournament" not in df.columns and "Player" in df.columns else (["Player", "Tournament"] if "Player" in df.columns and "Tournament" in df.columns else None))
-                else:
-                    append_csv(CLV_FILE, df)
-                st.success(f"Imported {len(df)} rows into {url_type}.")
-                st.dataframe(df.head(100), use_container_width=True)
-
-elif page == "CLV Tracker":
-    st.markdown("### 📈 CLV Tracker")
-    st.caption("Upload closing lines to learn whether projections beat the market. Positive Signed CLV = good. This feeds the confidence adjustment with strict sample caps.")
-    cf = st.file_uploader("Upload closing-line CSV", type=["csv"], key="clv_upload")
-    st.write("Required: Player, Stat, Closing Line. Optional: Date, Book.")
-    if cf is not None:
-        close = pd.read_csv(cf)
-        if {"Player", "Stat", "Closing Line"}.issubset(close.columns) and not engine.empty:
-            tmp = engine.copy()
-            tmp["PlayerKey"] = tmp["Player"].map(norm_name)
-            close["PlayerKey"] = close["Player"].map(norm_name)
-            merged = tmp.merge(close[["PlayerKey", "Stat", "Closing Line"]], on=["PlayerKey", "Stat"], how="inner")
-            if merged.empty:
-                st.warning("No matching current projections found for those closing lines.")
-            else:
-                merged["Signed CLV"] = merged.apply(lambda r: signed_clv(r.get("UD/Line"), r.get("Closing Line"), r.get("Decision")), axis=1)
-                merged["CLV Result"] = np.where(pd.to_numeric(merged["Signed CLV"], errors="coerce") > 0, "BEAT_CLOSE", np.where(pd.to_numeric(merged["Signed CLV"], errors="coerce") < 0, "LOST_CLOSE", "PUSH_CLOSE"))
-                merged["Logged At"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                cols = ["Logged At", "Player", "Opponent", "Stat", "Bucket", "Decision", "UD/Line", "Closing Line", "Signed CLV", "CLV Result", "TENNIS PROJ", "Confidence %", "Surface", "Tournament Level"]
-                append_csv(CLV_FILE, merged[[c for c in cols if c in merged.columns]])
-                st.success("CLV saved.")
-                st.dataframe(merged[[c for c in cols if c in merged.columns]], use_container_width=True)
-        else:
-            st.error("CSV needs Player, Stat, Closing Line and the current board must be loaded.")
-    clv = read_csv_safe(CLV_FILE)
-    if clv.empty:
-        st.info("No CLV history yet.")
-    else:
-        clv["Signed CLV"] = pd.to_numeric(clv.get("Signed CLV"), errors="coerce")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("CLV Samples", len(clv))
-        c2.metric("Avg Signed CLV", f"{clv['Signed CLV'].mean():+.2f}")
-        c3.metric("Beat Close %", f"{(clv['Signed CLV']>0).mean()*100:.1f}%")
-        tabs = st.tabs(["By Player/Prop", "By Prop", "Raw CLV"] )
-        with tabs[0]:
-            grp = clv.groupby(["Player", "Bucket"], dropna=False).agg(Sample=("Signed CLV", "count"), Avg_CLV=("Signed CLV", "mean"), Beat_Close_Pct=("Signed CLV", lambda x: (pd.to_numeric(x, errors='coerce')>0).mean()*100)).reset_index()
-            st.dataframe(grp.sort_values(["Sample", "Avg_CLV"], ascending=[False, False]), use_container_width=True, height=420)
-        with tabs[1]:
-            grp = clv.groupby(["Bucket"], dropna=False).agg(Sample=("Signed CLV", "count"), Avg_CLV=("Signed CLV", "mean"), Beat_Close_Pct=("Signed CLV", lambda x: (pd.to_numeric(x, errors='coerce')>0).mean()*100)).reset_index()
-            st.dataframe(grp.sort_values("Sample", ascending=False), use_container_width=True, height=420)
-        with tabs[2]:
-            st.dataframe(clv.tail(700), use_container_width=True, height=420)
-
-elif page == "Learning Engine":
-    st.markdown("### 🧠 Tennis Learning Engine")
-    mem = read_csv_safe(LEARNING_FILE)
-    if mem.empty:
-        st.info("No learning memory yet. Save projections, then upload graded results with Player, Stat, Actual.")
-    else:
-        mem["Error"] = pd.to_numeric(mem.get("Error"), errors="coerce")
-        tabs = st.tabs(["Player Bias", "Prop Bias", "Surface Bias", "Tournament Bias", "Raw Memory"])
-        with tabs[0]:
-            grp = mem.groupby(["Player", "Bucket"], dropna=False).agg(Sample=("Error", "count"), Avg_Error=("Error", "mean"), Hit_Rate=("Result", lambda x: (x.astype(str)=="WIN").mean()*100)).reset_index()
-            st.dataframe(grp[grp["Sample"]>=2].sort_values(["Sample", "Avg_Error"], ascending=[False, False]), use_container_width=True, height=420)
-        with tabs[1]:
-            grp = mem.groupby(["Bucket"], dropna=False).agg(Sample=("Error", "count"), Avg_Error=("Error", "mean"), Hit_Rate=("Result", lambda x: (x.astype(str)=="WIN").mean()*100)).reset_index()
-            st.dataframe(grp.sort_values("Sample", ascending=False), use_container_width=True, height=420)
-        with tabs[2]:
-            grp = mem.groupby(["Surface", "Bucket"], dropna=False).agg(Sample=("Error", "count"), Avg_Error=("Error", "mean"), Hit_Rate=("Result", lambda x: (x.astype(str)=="WIN").mean()*100)).reset_index()
-            st.dataframe(grp.sort_values("Sample", ascending=False), use_container_width=True, height=420)
-        with tabs[3]:
-            grp = mem.groupby(["Tournament Level", "Bucket"], dropna=False).agg(Sample=("Error", "count"), Avg_Error=("Error", "mean"), Hit_Rate=("Result", lambda x: (x.astype(str)=="WIN").mean()*100)).reset_index()
-            st.dataframe(grp.sort_values("Sample", ascending=False), use_container_width=True, height=420)
-        with tabs[4]:
-            st.dataframe(mem.tail(700), use_container_width=True, height=420)
-
-elif page == "Logs":
-    st.markdown("### 📁 Logs")
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["Player Master Log", "Underdog Line Log", "Elite Tags", "Snapshots", "Charting Overlay", "Status Flags", "Draw Status", "CLV Tracker"])
-    with tab1: st.dataframe(read_csv_safe(MASTER_LOG_FILE).tail(500), use_container_width=True, height=480)
-    with tab2: st.dataframe(read_csv_safe(UD_LOG_FILE).tail(500), use_container_width=True, height=480)
-    with tab3: st.dataframe(read_csv_safe(ELITE_FILE), use_container_width=True, height=480)
-    with tab4: st.dataframe(read_csv_safe(SNAPSHOT_FILE).tail(500), use_container_width=True, height=480)
-    with tab5: st.dataframe(read_csv_safe(CHARTING_FILE).tail(500), use_container_width=True, height=480)
-    with tab6: st.dataframe(read_csv_safe(STATUS_FILE).tail(500), use_container_width=True, height=480)
-    with tab7: st.dataframe(read_csv_safe(DRAW_FILE).tail(500), use_container_width=True, height=480)
-    with tab8: st.dataframe(read_csv_safe(CLV_FILE).tail(500), use_container_width=True, height=480)
-
-elif page == "After Grading":
-    st.markdown("### ✅ After Grading / Learning")
-    st.caption("Upload CSV with Player, Stat, Actual. It will calculate WIN/LOSS and projection error, then feed the learning file.")
-    gf = st.file_uploader("Upload graded results CSV", type=["csv"], key="grade")
+        df=pd.read_csv(f); 
+        if {'Player','Stat','UD/Line'}.issubset(df.columns):
+            if 'Opponent' not in df: df['Opponent']=''
+            if 'Matchup' not in df: df['Matchup']=''
+            df['Bucket']=df['Stat'].map(prop_bucket); df['Line Source']='Upload'; df['Pulled At']=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            st.session_state.manual_board=df; st.success(f'Loaded {len(df)} uploaded lines.'); st.rerun()
+        else: st.error('CSV needs Player, Stat, UD/Line')
+    st.dataframe(st.session_state.manual_board, use_container_width=True)
+with tabs[5]:
+    st.subheader('Data Health')
+    st.write({'History Source':hist_source,'History Error':hist_err,'Underdog URL':ud_url,'Underdog Error':ud_err})
+    st.write('Historical columns:', list(hist.columns)[:40] if not hist.empty else [])
+    st.dataframe(hist.tail(20), use_container_width=True)
+    st.caption('If Underdog is 0, use Upload/Manual. If history is 0, click refresh or redeploy. The app now shows the real error here.')
+with tabs[6]:
+    st.subheader('After Grade / Learning Engine')
+    st.caption('Upload results with: Player, Stat or Bucket, Projection, Actual. The app learns projection error by player/prop/surface/tournament.')
+    gf=st.file_uploader('Upload graded results CSV', type=['csv'], key='grade')
     if gf is not None:
-        gd = pd.read_csv(gf)
-        res = grade_from_result_file(gd, engine)
-        if res.empty:
-            st.error("Need columns Player, Stat, Actual and current board loaded.")
-        else:
-            st.success("Grades saved to learning memory.")
-            st.dataframe(res, use_container_width=True, height=520)
-            hit = res["Result"].astype(str).eq("WIN").mean()
-            st.metric("Current Upload Hit Rate", f"{hit*100:.1f}%")
-    st.markdown("#### Learning Memory")
-    st.dataframe(read_csv_safe(LEARNING_FILE).tail(500), use_container_width=True, height=420)
+        gd=pd.read_csv(gf)
+        if 'Bucket' not in gd and 'Stat' in gd: gd['Bucket']=gd['Stat'].map(prop_bucket)
+        if 'Error' not in gd and {'Actual','Projection'}.issubset(gd.columns): gd['Error']=pd.to_numeric(gd['Actual'],errors='coerce')-pd.to_numeric(gd['Projection'],errors='coerce')
+        for col,val in [('Surface',surface),('Tournament Level',level),('Graded At',datetime.now().strftime('%Y-%m-%d %H:%M:%S'))]:
+            if col not in gd: gd[col]=val
+        append_csv(GRADE_FILE,gd); append_csv(LEARNING_FILE,gd); st.success('Grades saved to learning memory.')
+    st.dataframe(read_csv(LEARNING_FILE).tail(500), use_container_width=True, height=420)
+with tabs[7]:
+    st.subheader('Logs')
+    a,b,c,d=st.tabs(['Snapshots','Underdog Lines','Player Master','Grades'])
+    with a: st.dataframe(read_csv(SNAPSHOT_FILE).tail(500),use_container_width=True,height=430)
+    with b: st.dataframe(read_csv(UD_LOG_FILE).tail(500),use_container_width=True,height=430)
+    with c: st.dataframe(read_csv(MASTER_FILE).tail(500),use_container_width=True,height=430)
+    with d: st.dataframe(read_csv(GRADE_FILE).tail(500),use_container_width=True,height=430)
