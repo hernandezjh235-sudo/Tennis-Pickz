@@ -20,7 +20,7 @@ import streamlit as st
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "ONE WAY PICKZ — TENNIS V7 UNDERDOG CLEAN MATCHER"
+APP_VERSION = "ONE WAY PICKZ — TENNIS V8 PULL BOARD CLEAN"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 LOG_DIR = BASE_DIR / "logs"
@@ -36,9 +36,11 @@ HISTORY_CACHE = DATA_DIR / "tennis_history_cache.csv"
 STARTER_PROFILES = DATA_DIR / "starter_player_profiles.csv"
 
 UNDERDOG_ENDPOINTS = [
+    "https://api.underdogfantasy.com/beta/v6/over_under_lines",
     "https://api.underdogfantasy.com/beta/v5/over_under_lines",
     "https://api.underdogfantasy.com/beta/v4/over_under_lines",
     "https://api.underdogfantasy.com/beta/v3/over_under_lines",
+    "https://api.underdogfantasy.com/beta/v2/over_under_lines",
 ]
 
 HEADERS = {
@@ -448,8 +450,8 @@ def line_value(line):
 def idx(items):
     return {str(x.get("id")): x for x in (items or []) if isinstance(x, dict) and x.get("id") is not None}
 
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_underdog():
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_underdog(refresh_key=0):
     last = ""
     for url in UNDERDOG_ENDPOINTS:
         try:
@@ -878,21 +880,39 @@ def show_table(df):
 if "manual_board" not in st.session_state:
     st.session_state.manual_board = pd.DataFrame()
 
+if "force_pull_ts" not in st.session_state:
+    st.session_state.force_pull_ts = 0
+if "hide_controls" not in st.session_state:
+    st.session_state.hide_controls = True
+
 with st.sidebar:
-    st.header("⚙️ Simple Controls")
-    min_conf = st.slider("Minimum confidence", 50, 75, 54)
+    st.header("⚙️ Board Controls")
+    # Hidden default: keeps the model filtering without confusing the screen.
+    min_conf = 54
     official_only = st.toggle("Official PASS only", False)
-    custom_url = st.text_input("Optional Underdog/API JSON URL", value="", help="Use this only if you have a stable provider/API URL. The app will normalize the JSON into tennis lines.")
-    if st.button("Clear manual board"):
+
+    if st.button("🔄 Refresh / Pull Underdog Board", use_container_width=True):
+        st.cache_data.clear()
+        st.session_state.force_pull_ts = datetime.now().timestamp()
+        st.rerun()
+
+    custom_url = st.text_input(
+        "Optional API/JSON URL",
+        value="",
+        help="Only needed if you connect a stable line-provider/API URL. Direct public Underdog can be blocked."
+    )
+
+    if st.button("Clear manual board", use_container_width=True):
         st.session_state.manual_board = pd.DataFrame()
         st.rerun()
-    st.caption("V7 auto-detects surface, best-of, indoor/outdoor, and tournament level from the match/tournament text.")
+
+    st.caption("Confidence filtering is hidden at 54 by default. V8 auto-detects surface, best-of, indoor/outdoor, and tournament level.")
 
 st.markdown(f"<div class='big-title'>{APP_VERSION}</div>", unsafe_allow_html=True)
 st.markdown("<div class='sub-title'>Clean board: Underdog attempt + easy manual fallback + automatic tennis context + tabs by prop.</div>", unsafe_allow_html=True)
 
 hist, hist_source, hist_err = load_history(4)
-payload, ud_url, ud_err = fetch_underdog()
+payload, ud_url, ud_err = fetch_underdog(st.session_state.get("force_pull_ts", 0))
 ud_board = parse_underdog(payload)
 custom_board, custom_err = fetch_custom_json_url(custom_url) if 'custom_url' in globals() and custom_url else (pd.DataFrame(), "")
 if not custom_board.empty:
@@ -915,8 +935,22 @@ metrics = [
 for col, (label, val) in zip([k1,k2,k3,k4,k5], metrics):
     col.markdown(f"<div class='kpi'><div class='kpi-v'>{val}</div><div class='kpi-l'>{label}</div></div>", unsafe_allow_html=True)
 
+pull_col1, pull_col2 = st.columns([1, 3])
+with pull_col1:
+    if st.button("🔄 Pull Board Now", use_container_width=True):
+        st.cache_data.clear()
+        st.session_state.force_pull_ts = datetime.now().timestamp()
+        st.rerun()
+with pull_col2:
+    if len(ud_board) > 0:
+        st.success(f"Pulled {len(ud_board)} auto lines from {ud_url}")
+    elif custom_url and custom_err:
+        st.error(f"Custom API/JSON URL error: {custom_err}")
+    else:
+        st.warning("Auto pull returned 0. This usually means Underdog blocked or changed the public endpoint. Paste/upload board lines in Board Builder.")
+
 if hist.empty:
-    st.info("Public ATP/WTA history is not loaded, so V6 is using starter player profiles + grading memory. The app will still project known players and learn from your results.")
+    st.info("Public ATP/WTA history is not loaded, so V8 is using starter player profiles + grading memory. The app will still project known players and learn from your results.")
 elif hist_source != "JEFF_SACKMANN":
     st.warning(f"History source: {hist_source}. {hist_err}")
 
@@ -978,13 +1012,13 @@ with tabs[4]:
         ])
         st.success("Loaded sample board.")
         st.rerun()
-    if c3.button("Use Underdog pull if available"):
+    if c3.button("Use auto pull if available"):
         if not ud_board.empty:
             st.session_state.manual_board = pd.DataFrame()
             st.success("Using Underdog board.")
             st.rerun()
         else:
-            st.error("Underdog endpoint returned 0 here. Paste the board instead.")
+            st.error("Auto pull returned 0 here. Paste/upload the board, or connect a stable API/JSON URL.")
 
     f = st.file_uploader("Upload board CSV", type=["csv"])
     if f is not None:
