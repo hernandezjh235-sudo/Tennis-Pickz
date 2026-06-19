@@ -20,7 +20,7 @@ import streamlit as st
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "ONE WAY PICKZ — TENNIS V6 CLEAN BOARD"
+APP_VERSION = "ONE WAY PICKZ — TENNIS V7 UNDERDOG CLEAN MATCHER"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 LOG_DIR = BASE_DIR / "logs"
@@ -122,11 +122,28 @@ def read_csv(path):
         return pd.DataFrame()
 
 def prop_bucket(stat):
-    s = str(stat).lower()
+    s = str(stat).lower().strip()
+    s = s.replace("breakpoints", "break points")
     if "ace" in s:
         return "ACES"
     if "double" in s and "fault" in s:
         return "DOUBLE_FAULTS"
+    if "1st" in s and "set" in s and "games played" in s:
+        return "FIRST_SET_TOTAL_GAMES"
+    if "1st" in s and "set" in s and "games won" in s:
+        return "FIRST_SET_PLAYER_GAMES"
+    if "first" in s and "set" in s and "games played" in s:
+        return "FIRST_SET_TOTAL_GAMES"
+    if "first" in s and "set" in s and "games won" in s:
+        return "FIRST_SET_PLAYER_GAMES"
+    if "sets played" in s:
+        return "SETS_PLAYED"
+    if "sets won" in s:
+        return "SETS_WON"
+    if "set" in s and "won" in s:
+        return "SETS_WON"
+    if "set" in s and "played" in s:
+        return "SETS_PLAYED"
     if "break point" in s:
         return "BREAK_POINTS"
     if "break" in s and "tie" not in s:
@@ -135,11 +152,11 @@ def prop_bucket(stat):
         return "TIEBREAK"
     if "games played" in s or ("total" in s and "game" in s):
         return "TOTAL_GAMES"
+    if "games won" in s:
+        return "PLAYER_GAMES"
     if "game" in s:
         return "PLAYER_GAMES"
-    if "set" in s:
-        return "SETS"
-    if "winner" in s or "moneyline" in s:
+    if "winner" in s or "moneyline" in s or "match result" in s:
         return "MATCH_WINNER"
     return "OTHER"
 
@@ -482,7 +499,7 @@ def parse_underdog(payload):
         full = (json.dumps(line) + json.dumps(app) + json.dumps(pl) + json.dumps(g)).lower()
         is_tennis = (
             "tennis" in full or "atp" in full or "wta" in full
-            or bucket in ["ACES","PLAYER_GAMES","TOTAL_GAMES","BREAK_POINTS","BREAKS","SETS","DOUBLE_FAULTS","MATCH_WINNER"]
+            or bucket in ["ACES","PLAYER_GAMES","TOTAL_GAMES","FIRST_SET_TOTAL_GAMES","FIRST_SET_PLAYER_GAMES","BREAK_POINTS","BREAKS","SETS_WON","SETS_PLAYED","DOUBLE_FAULTS","MATCH_WINNER"]
         )
         if not is_tennis:
             continue
@@ -506,6 +523,90 @@ def parse_underdog(payload):
         return df
     df = df[df["Player"].astype(str).str.len() > 1]
     return df.drop_duplicates(subset=["Player","Stat","UD/Line","Matchup"]).reset_index(drop=True)
+
+
+
+def flatten_json_records(obj):
+    """Find likely prop rows inside unknown provider JSON."""
+    found = []
+    def walk(x):
+        if isinstance(x, dict):
+            keys = set(k.lower() for k in x.keys())
+            if any(k in keys for k in ["player", "player_name", "name", "participant_name"]) and any(k in keys for k in ["line", "stat_value", "projection", "value"]):
+                found.append(x)
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    walk(obj)
+    return found
+
+def parse_external_lines_payload(payload, source_name="External API/JSON"):
+    """
+    Flexible normalizer for Apify/SharpAPI/CSV-like JSON.
+    Expected fields can be any of:
+    player/player_name/name, stat/market/stat_type, line/projection/value,
+    opponent/matchup/event/tournament.
+    """
+    if not payload:
+        return pd.DataFrame()
+    if isinstance(payload, list):
+        records = payload
+    else:
+        records = flatten_json_records(payload)
+
+    rows = []
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        player = clean_name(
+            r.get("player") or r.get("player_name") or r.get("participant_name") or
+            r.get("name") or r.get("athlete") or r.get("display_name") or ""
+        )
+        stat = (
+            r.get("stat") or r.get("stat_type") or r.get("market") or r.get("prop") or
+            r.get("selection") or r.get("display_stat") or r.get("bet_type") or ""
+        )
+        val = sf(r.get("line") or r.get("stat_value") or r.get("projection") or r.get("value") or r.get("handicap"))
+        opponent = clean_name(r.get("opponent") or r.get("opponent_name") or "")
+        matchup = r.get("matchup") or r.get("event") or r.get("game") or r.get("fixture") or ""
+        tournament = r.get("tournament") or r.get("league") or r.get("competition") or ""
+        if not player or not stat or pd.isna(val):
+            continue
+        # Keep tennis only if source provides league/sport OR if prop name is tennis-style.
+        sport_blob = " ".join(str(r.get(k, "")) for k in ["sport","league","competition","tournament","event","matchup"]).lower()
+        b = prop_bucket(stat)
+        is_tennis = ("tennis" in sport_blob or "atp" in sport_blob or "wta" in sport_blob or b != "OTHER")
+        if not is_tennis:
+            continue
+        rows.append({
+            "Player": player,
+            "Opponent": opponent,
+            "Matchup": matchup,
+            "Tournament": tournament,
+            "Stat": stat,
+            "Bucket": b,
+            "UD/Line": val,
+            "Line Source": source_name,
+            "Start Time": r.get("start_time") or r.get("startTime") or r.get("commence_time") or "",
+            "Raw ID": r.get("id", ""),
+            "Pulled At": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    return pd.DataFrame(rows).drop_duplicates() if rows else pd.DataFrame()
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_custom_json_url(url):
+    if not url:
+        return pd.DataFrame(), ""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=18)
+        if r.status_code != 200:
+            return pd.DataFrame(), f"Custom URL HTTP {r.status_code}"
+        payload = r.json()
+        return parse_external_lines_payload(payload, "Custom JSON/API"), ""
+    except Exception as e:
+        return pd.DataFrame(), str(e)[:180]
 
 # ------------------------- manual board -------------------------
 
@@ -608,11 +709,20 @@ def project(row, hist):
     service_games = (5.0 * sets) + (.55 * close) + (.25 if strength_gap > 4 else 0)
     sfac = SURFACE_FACTOR.get(surface, 1) * INDOOR_FACTOR.get(indoor, 1) * LEVEL_FACTOR.get(level, 1)
 
+    win_prob = clamp(.50 + strength_gap / 42, .18, .82)
+    three_set_prob = clamp(.18 + .42 * close, .16, .62) if best_of == 3 else clamp(.34 + .46 * close, .25, .78)
+    first_set_total = clamp(9.35 + 2.1 * close + (0.25 if surface == "Grass" else 0) - (0.15 if surface == "Clay" else 0), 8.4, 12.9)
+    first_set_player_games = clamp(first_set_total * win_prob + 0.15 * np.sign(strength_gap), 2.6, 7.2)
+
     if bucket == "ACES":
-        proj = p["ace_per_service_game"] * service_games * sfac
+        # Aces = ace rate per service game * projected service games * surface/indoor/event context.
+        # Grass/indoor raises ace volume; elite returners reduce it.
+        return_tax = 1 - clamp((o["return_points_won_pct"] - .37) * .25, -.08, .10)
+        proj = p["ace_per_service_game"] * service_games * sfac * return_tax
         sigma = clamp(1.15 + proj * .32, 1.35, 4.8)
     elif bucket == "DOUBLE_FAULTS":
-        proj = p["df_per_service_game"] * service_games * (1.06 if o["return_points_won_pct"] > .39 else 1.0)
+        pressure = 1.06 if o["return_points_won_pct"] > .39 else 1.0
+        proj = p["df_per_service_game"] * service_games * pressure
         sigma = clamp(.85 + proj * .40, 1.0, 3.2)
     elif bucket == "PLAYER_GAMES":
         proj = 4.85 * sets + clamp(strength_gap / 17, -1.45, 1.45)
@@ -620,17 +730,27 @@ def project(row, hist):
     elif bucket == "TOTAL_GAMES":
         proj = 9.65 * sets + 1.85 * close
         sigma = 3.25 if best_of == 3 else 5.1
-    elif bucket == "SETS":
-        win_prob = clamp(.50 + strength_gap / 42, .18, .82)
-        # For 0.5 sets won, projection is expected sets won, not probability only.
-        proj = clamp(win_prob * sets, .15, sets - .15)
+    elif bucket == "FIRST_SET_TOTAL_GAMES":
+        proj = first_set_total
+        sigma = 1.45
+    elif bucket == "FIRST_SET_PLAYER_GAMES":
+        proj = first_set_player_games
+        sigma = 1.25
+    elif bucket == "SETS_WON":
+        # Expected sets won. For 0.5 lines, this acts like chance to win at least one set.
+        straight_loss_risk = clamp((.50 - win_prob) * 1.35 + (1-close) * .22, .04, .70)
+        proj = clamp((1 - straight_loss_risk) * (1 + 0.65 * three_set_prob), .12, 2.65 if best_of == 3 else 4.65)
         sigma = .72
+    elif bucket == "SETS_PLAYED":
+        proj = 2 + three_set_prob if best_of == 3 else 3.1 + 1.4 * three_set_prob
+        sigma = .62 if best_of == 3 else .95
     elif bucket in ["BREAKS", "BREAK_POINTS"]:
         opp_weak = clamp((.80 - o["hold_pct"]) * 2.0 + (p["return_points_won_pct"] - .36) * 2.2, -.55, .95)
         base = (.95 * sets) if bucket == "BREAKS" else (2.15 * sets)
         proj = base * (1 + .26 * opp_weak)
         sigma = clamp(1.15 + proj * .52, 1.3, 4.1)
     elif bucket == "MATCH_WINNER":
+        # For ML rows, Projection is win probability, line is informational if no true decimal/American edge is available.
         proj = clamp(50 + strength_gap * 1.65, 15, 85)
         sigma = 14
     else:
@@ -656,11 +776,11 @@ def project(row, hist):
         official = False; reasons.append("UNSUPPORTED")
     if bucket == "ACES" and (abs(edge) < .60 or conf < 56):
         official = False; reasons.append("ACE_EDGE_LOW")
-    elif bucket in ["PLAYER_GAMES","TOTAL_GAMES"] and (abs(edge) < .70 or conf < 56):
+    elif bucket in ["PLAYER_GAMES","TOTAL_GAMES","FIRST_SET_TOTAL_GAMES","FIRST_SET_PLAYER_GAMES","SETS_WON","SETS_PLAYED"] and (abs(edge) < .55 or conf < 56):
         official = False; reasons.append("GAME_EDGE_LOW")
     elif bucket in ["BREAKS","BREAK_POINTS","DOUBLE_FAULTS"] and (abs(edge) < .65 or conf < 57):
         official = False; reasons.append("VOL_EDGE_LOW")
-    elif bucket == "SETS" and (abs(edge) < .16 or conf < 56):
+    elif bucket == "SETS_WON" and (abs(edge) < .16 or conf < 56):
         official = False; reasons.append("SET_EDGE_LOW")
     elif bucket == "MATCH_WINNER" and conf < 56:
         official = False; reasons.append("ML_EDGE_LOW")
@@ -762,10 +882,11 @@ with st.sidebar:
     st.header("⚙️ Simple Controls")
     min_conf = st.slider("Minimum confidence", 50, 75, 54)
     official_only = st.toggle("Official PASS only", False)
+    custom_url = st.text_input("Optional Underdog/API JSON URL", value="", help="Use this only if you have a stable provider/API URL. The app will normalize the JSON into tennis lines.")
     if st.button("Clear manual board"):
         st.session_state.manual_board = pd.DataFrame()
         st.rerun()
-    st.caption("Surface, best-of, indoor/outdoor, and level are now auto-inferred from tournament/match text.")
+    st.caption("V7 auto-detects surface, best-of, indoor/outdoor, and tournament level from the match/tournament text.")
 
 st.markdown(f"<div class='big-title'>{APP_VERSION}</div>", unsafe_allow_html=True)
 st.markdown("<div class='sub-title'>Clean board: Underdog attempt + easy manual fallback + automatic tennis context + tabs by prop.</div>", unsafe_allow_html=True)
@@ -773,15 +894,19 @@ st.markdown("<div class='sub-title'>Clean board: Underdog attempt + easy manual 
 hist, hist_source, hist_err = load_history(4)
 payload, ud_url, ud_err = fetch_underdog()
 ud_board = parse_underdog(payload)
+custom_board, custom_err = fetch_custom_json_url(custom_url) if 'custom_url' in globals() and custom_url else (pd.DataFrame(), "")
+if not custom_board.empty:
+    append_csv(UD_LOG_FILE, custom_board)
 if not ud_board.empty:
     append_csv(UD_LOG_FILE, ud_board)
 
-board = ud_board if not ud_board.empty else st.session_state.manual_board
+# Priority: Custom JSON/API URL > direct Underdog attempt > manual board.
+board = custom_board if not custom_board.empty else (ud_board if not ud_board.empty else st.session_state.manual_board)
 engine = run_engine(board, hist, min_conf=min_conf, official_only=official_only) if not board.empty else pd.DataFrame()
 
 k1,k2,k3,k4,k5 = st.columns(5)
 metrics = [
-    ("Underdog Lines", len(ud_board)),
+    ("Auto Lines", len(ud_board)),
     ("History Rows", len(hist)),
     ("Board Lines", len(board)),
     ("Official PASS", int((engine.get("Official Filter", pd.Series(dtype=str)) == "PASS").sum()) if not engine.empty else 0),
@@ -796,7 +921,7 @@ elif hist_source != "JEFF_SACKMANN":
     st.warning(f"History source: {hist_source}. {hist_err}")
 
 if ud_board.empty:
-    st.warning("Underdog public endpoint did not return tennis lines here. Use the Board Builder tab to paste the Underdog lines from the app.")
+    st.warning("Auto line pull returned 0 here. Use Board Builder paste, upload CSV, or add a stable API/JSON URL in the sidebar.")
 
 tabs = st.tabs(["🏠 Dashboard", "🎯 Aces", "🎾 Games/Sets", "💥 Breaks/DF", "⬆️ Board Builder", "✅ Grade + Learning", "🩺 Data Health", "📚 Logs"])
 
@@ -821,7 +946,7 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("🎾 Games / Sets / Moneyline")
-    df = engine[engine["Bucket"].isin(["PLAYER_GAMES","TOTAL_GAMES","SETS","MATCH_WINNER"])] if not engine.empty else pd.DataFrame()
+    df = engine[engine["Bucket"].isin(["PLAYER_GAMES","TOTAL_GAMES","FIRST_SET_TOTAL_GAMES","FIRST_SET_PLAYER_GAMES","SETS_WON","SETS_PLAYED","MATCH_WINNER"])] if not engine.empty else pd.DataFrame()
     show_table(df) if not df.empty else st.info("No games/sets props loaded.")
 
 with tabs[3]:
@@ -846,8 +971,8 @@ with tabs[4]:
     if c2.button("Load Shelton/Fritz screenshot sample"):
         st.session_state.manual_board = pd.DataFrame([
             {"Player":"Taylor Fritz","Opponent":"Ben Shelton","Matchup":"Ben Shelton vs Taylor Fritz","Tournament":"ATP Halle","Stat":"Aces","Bucket":"ACES","UD/Line":13.5,"Line Source":"Sample","Pulled At":datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
-            {"Player":"Taylor Fritz","Opponent":"Ben Shelton","Matchup":"Ben Shelton vs Taylor Fritz","Tournament":"ATP Halle","Stat":"Sets Won","Bucket":"SETS","UD/Line":0.5,"Line Source":"Sample","Pulled At":datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
-            {"Player":"Ben Shelton","Opponent":"Taylor Fritz","Matchup":"Ben Shelton vs Taylor Fritz","Tournament":"ATP Halle","Stat":"Sets Won","Bucket":"SETS","UD/Line":0.5,"Line Source":"Sample","Pulled At":datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+            {"Player":"Taylor Fritz","Opponent":"Ben Shelton","Matchup":"Ben Shelton vs Taylor Fritz","Tournament":"ATP Halle","Stat":"Sets Won","Bucket":"SETS_WON","UD/Line":0.5,"Line Source":"Sample","Pulled At":datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+            {"Player":"Ben Shelton","Opponent":"Taylor Fritz","Matchup":"Ben Shelton vs Taylor Fritz","Tournament":"ATP Halle","Stat":"Sets Won","Bucket":"SETS_WON","UD/Line":0.5,"Line Source":"Sample","Pulled At":datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
             {"Player":"Taylor Fritz","Opponent":"Ben Shelton","Matchup":"Ben Shelton vs Taylor Fritz","Tournament":"ATP Halle","Stat":"Games Played","Bucket":"TOTAL_GAMES","UD/Line":26.5,"Line Source":"Sample","Pulled At":datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
             {"Player":"Alexander Zverev","Opponent":"Raphael Collignon","Matchup":"Alexander Zverev vs Raphael Collignon","Tournament":"ATP Halle","Stat":"Match Winner","Bucket":"MATCH_WINNER","UD/Line":50,"Line Source":"Sample","Pulled At":datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
         ])
